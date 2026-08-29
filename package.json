@@ -1,0 +1,21 @@
+{
+  "name": "koishi-plugin-hds-interlude",
+  "version": "0.1.4-beta3",
+  "description": "A time-aware, persistent narrative chat framework for Koishi.",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit --incremental false --composite false --noUnusedLocals --noUnusedParameters",
+    "test": "node --import tsx --test test/*.test.ts"
+  },
+  "files": ["lib", "README.md", "DEPLOYMENT_GUIDE.md", "CONFIGURATION_GUIDE.md", "BEGINNER_GUIDE.md", "command.md", "docs/ARCHITECTURE.md", "docs/ALTER_SYSTEM.md", "docs/AGENCY_WINDOW.md", "docs/CHANGELOG.md", "docs/SECURITY.md"],
+  "keywords": ["koishi", "chatbot", "roleplay", "narrative"],
+  "license": "AGPL-3.0",
+  "koishi": {"service": {"optional": ["puppeteer"]}},
+  "peerDependencies": {"koishi": "^4.18.7", "koishi-plugin-puppeteer": "^3.9.0"},
+  "peerDependenciesMeta": {"koishi-plugin-puppeteer": {"optional": true}},
+  "devDependencies": {"koishi-plugin-puppeteer": "^3.9.0"},
+  "dependencies": {"qface": "^1.4.1"}
+}
+
+
