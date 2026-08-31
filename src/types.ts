@@ -31,6 +31,8 @@ export interface StoryState {
   continuitySnapshot?: ContinuitySnapshot
   narrativeUpdateCount: number
   lastContinuityUpdateAt?: string
+  /** Forces the next successful narrative write to rebuild continuity. */
+  continuityDirty?: boolean
   /** 自动推进时钟；ISO 字符串便于跨进程/数据库 JSON 持久化。 */
   automation: StoryAutomationState
   alterSystem?: AlterSystemState
@@ -39,6 +41,23 @@ export interface StoryState {
   scenePresence?: ScenePresenceState[]
   /** Recent completed background deliveries; hidden from live user turns. */
   automaticDeliverySummaries?: AutomaticDeliverySummary[]
+  /** Small concrete in-flight details (codes, orders, errands) captured by scene
+   * compaction; they expire naturally and never modify canon. */
+  workingDetails?: WorkingDetail[]
+  /** Host-owned unresolved state carried forward from the latest completed
+   * automatic event ledger. This outranks prose-derived scratchpad wording. */
+  timelineCarry?: string[]
+}
+
+/** A tiny structured scratchpad entry. Not a durable fact: it exists to carry
+ * small concrete details across the compaction boundary and then expire. */
+export interface WorkingDetail {
+  label: string
+  value: string
+  /** Strictly-future ISO-8601; expired details are pruned at injection time. */
+  expiresAt?: string
+  createdAt: string
+  sourceEntryIds?: number[]
 }
 
 export type ScenePresenceStatus = 'present' | 'off-scene' | 'expected'
@@ -57,6 +76,88 @@ export interface AutomaticDeliverySummary {
   summary: string
   sourceEntryId?: number
   deliveredAt: string
+}
+
+export type SchedulePreplanBlockKind = 'fixed' | 'routine' | 'flexible' | 'open'
+export type SchedulePreplanWeekday = 'monday' | 'tuesday' | 'wednesday' | 'thursday' | 'friday' | 'saturday' | 'sunday'
+
+export interface SchedulePreplanBlock {
+  id: string
+  start: string
+  end: string
+  label: string
+  kind: SchedulePreplanBlockKind
+  location?: string
+  /** A granular-mode possibility, never a confirmed appointment. The host
+   * reveals it only close to its slot and never lets it anchor time. */
+  tentative?: boolean
+  sourceEntryIds?: number[]
+}
+
+export interface SchedulePreplanRegime {
+  id: string
+  label: string
+  from: string
+  to?: string
+  weekly: Partial<Record<SchedulePreplanWeekday, SchedulePreplanBlock[]>>
+  sourceEntryIds?: number[]
+}
+
+export interface SchedulePreplanException {
+  date: string
+  mode: 'replace' | 'patch'
+  reason: string
+  removeBlockIds?: string[]
+  blocks?: SchedulePreplanBlock[]
+  sourceEntryIds?: number[]
+}
+
+export interface SchedulePreplanDay {
+  date: string
+  blocks: SchedulePreplanBlock[]
+}
+
+export interface SchedulePreplanRecord {
+  storyId: string
+  revision: number
+  timezone: string
+  validFrom: string
+  validThrough: string
+  lastReviewedLocalDate: string
+  lastEvidenceEntryId: number
+  reviewReason: string
+  regimes: SchedulePreplanRegime[]
+  exceptions: SchedulePreplanException[]
+  materializedDays: SchedulePreplanDay[]
+  createdAt: Date
+  updatedAt: Date
+}
+
+export interface SchedulePreplanProposal {
+  outcome: 'unchanged' | 'extend' | 'patch' | 'replace'
+  reason: string
+  confidence?: number
+  sourceEntryIds?: number[]
+  regimes?: SchedulePreplanRegime[]
+  exceptions?: SchedulePreplanException[]
+}
+
+export interface SchedulePreplanReviewRequest {
+  localDate: string
+  horizonDays: number
+  variationLevel?: 'stable' | 'contextual' | 'granular'
+  current: SchedulePreplanRecord | null
+  evidenceEntries: ScriptEntry[]
+}
+
+export interface SchedulePreplanWindow {
+  name: 'Schedule Preplan'
+  timezone: string
+  from: string
+  to: string
+  plannedNotObserved: true
+  revision: number
+  blocks: Array<SchedulePreplanBlock & { date: string }>
 }
 
 /** Compact replace-in-place reminder of the protagonist's current state and notable threads. */
@@ -190,6 +291,8 @@ export interface ScriptEntry {
   content: string
   occurredAt: Date
   metadata: Record<string, unknown>
+  /** Optional semantic vector for history recall; empty until the backfill reaches this entry. */
+  embedding?: number[]
   createdAt: Date
 }
 
@@ -354,6 +457,14 @@ export interface OutgoingMessageDraft {
   content: string
   /** Attached only to no-current-user background deliveries. */
   automaticDelivery?: Pick<AutomaticDeliverySummary, 'summary' | 'sourceEntryId'>
+  /** The visible reply contract is recorded only after transport succeeds. */
+  interaction?: NarrativeInteraction | null
+  /** Split bubbles are scheduled only after their first bubble was delivered. */
+  laterSegments?: string[]
+  /** Lets a failed delivery explain whether it originated in a live user turn. */
+  userInitiated?: boolean
+  /** Set by transport when a literal quote was converted into a platform reply. */
+  quoteMessageId?: string
 }
 
 /** A future browsing action proposed by the narrator. It is not an observed
@@ -390,6 +501,14 @@ export interface NarrativeInteraction {
     /** Opaque current-turn message reference; accepted only when the host advertises quote reply. */
     replyTo?: string
   }
+}
+
+/** A complete transport field decoded before the streamed narrative script. */
+export interface EarlyNarrativeReply {
+  kind: 'private' | 'group'
+  content: string
+  interaction?: NarrativeInteraction
+  groupReply?: { mode: 'immediate'; content: string; replyTo?: string }
 }
 
 export type ChatReactionName = 'like' | 'smile' | 'laugh' | 'heart' | 'surprised' | 'sad' | 'angry'
@@ -441,6 +560,8 @@ export interface StickerAsset {
   description: string
   aliases: string[]
   status: 'pending' | 'active' | 'missing'
+  /** Optional semantic vector for catalog filtering; empty until the Embedding backfill reaches this asset. */
+  embedding?: number[]
   createdAt: Date
   updatedAt: Date
 }
@@ -538,8 +659,19 @@ export interface NarrativeRequest {
   from: Date
   now: Date
   userMessage?: string
+  /** Explicit clock references stated by the user in this one message. They
+   * describe reported past/future events, not the message receive time. */
+  userReportedTimes?: UserReportedTime[]
   /** Native image inputs observed in this one incoming user event only. */
   images?: NarrativeImage[]
+  /** Text-only observations produced by a separately configured visual model.
+   * They are transient current-event context and never enter script storage. */
+  visualObservations?: string[]
+  /** Host-validated event plan for an automatic window. Prose renders this plan
+   * but is no longer the source of temporal truth. */
+  timelinePlan?: TimelinePlan
+  /** Latest host-owned unresolved state from previously completed automatic beats. */
+  timelineCarry?: string[]
   /** The relationship that caused this turn; null for unattended life updates. */
   participant: InterludeParticipant | null
   /** Other currently enrolled relationship branches, ordered by relevance. */
@@ -547,10 +679,14 @@ export interface NarrativeRequest {
   /** Sensitive details of other participants are opt-in because the model may be remote. */
   shareParticipantDetails: boolean
   dueIntents: NarrativeIntent[]
+  /** Bounded, host-owned future plans; continuity no longer duplicates them as free text. */
+  upcomingIntents?: NarrativeIntent[]
   /** Consequences already in motion. They are context, never newly due events. */
   activeConsequences: NarrativeIntent[]
   supersededIntents: NarrativeIntent[]
   recentEntries: ScriptEntry[]
+  /** Raw chat entries at or after this point survive the normal prose budget. */
+  recentProtectionSince?: Date
   memories: NarrativeMemory[]
   sceneContext?: SceneContext
   facts?: NarrativeFact[]
@@ -574,6 +710,55 @@ export interface NarrativeRequest {
   automaticDeliverySummaries?: AutomaticDeliverySummary[]
   /** At most two relationship-local promises, included only on live/due turns. */
   followUpCommitments?: NarrativeIntent[]
+  /** Only the next twelve hours of Schedule Preplan are exposed to narration. */
+  schedulePreplan?: SchedulePreplanWindow | null
+  /** Ephemeral transport callback; never serialised into the model payload. */
+  onEarlyReply?: (reply: EarlyNarrativeReply) => Promise<boolean>
+  /** Small concrete in-flight details carried from story state (pruned, capped). */
+  workingDetails?: WorkingDetail[]
+  /** Older moments semantically related to the current message; private live turns only. */
+  recalledHistory?: RecalledMoment[]
+}
+
+export interface UserReportedTime {
+  localTime: string
+  relation: 'past' | 'future' | 'current'
+  statement: string
+}
+
+export type TimelineBeatKind = 'activity' | 'thought' | 'state'
+
+/** A compact, relative-time event ledger. `at` is always within [0, 1] and is
+ * mapped by the host onto the current narration window. */
+export interface TimelineBeat {
+  at: number
+  kind: TimelineBeatKind
+  summary: string
+}
+
+export interface TimelinePlan {
+  beats: TimelineBeat[]
+  carry?: string[]
+}
+
+export interface TimelinePlanRequest {
+  story: InterludeStory
+  participant: InterludeParticipant | null
+  phase: Extract<NarrativePhase, 'advance' | 'conversation-follow-up' | 'intent-due'>
+  from: Date
+  now: Date
+  scene: InterludeScene | null
+  facts: NarrativeFact[]
+  recentEntries: ScriptEntry[]
+  dueIntents: NarrativeIntent[]
+  schedulePreplan?: SchedulePreplanWindow | null
+}
+
+/** One retrieved older script moment for the semantic history recall block. */
+export interface RecalledMoment {
+  id: number
+  occurredAt: string
+  content: string
 }
 
 export interface GroupMessageContext {
@@ -623,9 +808,18 @@ export const emptyParticipantState = (): ParticipantState => ({
   openThreads: [], relationshipNotes: [], unreadMessageCount: 0, pendingReplyCount: 0,
 })
 
+/** A compact summary of one immediately-preceding closed scene, surfaced so the
+ * raw context window and the arc do not leave a memory gap between them. */
+export interface PreviousSceneSummary {
+  startedAt: string
+  endedAt: string
+  summary: string
+}
+
 export interface SceneContext {
   scene: InterludeScene | null
   arc: InterludeArc | null
+  previousScenes?: PreviousSceneSummary[]
 }
 
 export interface CompactionRequest {
@@ -641,6 +835,7 @@ export interface CompactionRequest {
   arc: InterludeArc | null
   participants: InterludeParticipant[]
   facts: NarrativeFact[]
+  schedulePreplan?: SchedulePreplanReviewRequest
 }
 
 export interface FactDraft {
@@ -651,6 +846,8 @@ export interface FactDraft {
   confidence?: number
   unresolved?: boolean
   sourceEntryIds?: number[]
+  /** Existing open facts fulfilled, cancelled or otherwise closed by this evidence. */
+  resolvesFactIds?: number[]
 }
 
 export interface StatePatchDraft {
@@ -676,6 +873,15 @@ export interface CompactionDecision {
   arc?: { title?: string; summary?: string }
   facts?: FactDraft[]
   statePatches?: StatePatchDraft[]
+  workingDetails?: WorkingDetailDraft[]
+  schedulePreplan?: SchedulePreplanProposal
+}
+
+export interface WorkingDetailDraft {
+  label: string
+  value: string
+  expiresAt?: string
+  sourceEntryIds?: number[]
 }
 
 export interface OverlayCompactionRequest {
@@ -697,6 +903,12 @@ export interface OverlayCompactionDecision {
 export interface NarrativeCompactor {
   compact(request: CompactionRequest): Promise<CompactionDecision>
   compactOverlay(request: OverlayCompactionRequest): Promise<OverlayCompactionDecision>
+  /** A small, independent daily review. Keeping it outside scene compaction
+   * prevents a large summary response from dropping the schedule field. */
+  planSchedulePreplan?(request: SchedulePreplanReviewRequest): Promise<SchedulePreplanProposal | undefined>
+  /** Low-temperature automatic-window director. A missing plan means the host
+   * must defer the write rather than let free prose advance reality. */
+  planTimeline?(request: TimelinePlanRequest): Promise<TimelinePlan | undefined>
 }
 
 export interface NarrativeEmbedder {

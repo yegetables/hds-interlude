@@ -59,7 +59,7 @@ test('each request includes only its current phase strategy', () => {
   assert.match(user, /CURRENT PHASE: USER MESSAGE/)
   assert.match(user, /same chat content as interaction\.reply/)
   assert.match(user, /until interaction\.reply carries it to the user/)
-  assert.match(user, /groupReply has the shape/)
+  assert.match(user, /always include groupReply with the shape/)
   assert.match(user, /same text as groupReply/)
   assert.doesNotMatch(user, /INDEPENDENT LIFE ADVANCE/)
   assert.match(advance, /CURRENT PHASE: INDEPENDENT LIFE ADVANCE/)

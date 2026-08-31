@@ -1,7 +1,16 @@
 import { Context, Service, Session } from 'koishi';
 import { ModelConfig } from './narrator';
 import { GroupWillingnessConfig } from './group-willingness';
-import { InterludeArc, InterludeScene, InterludeParticipant, InterludeStory, NarrativeDecision, NarrativeFact, NarrativeIntent, GroupContext, NarrativeProvider, NarrativeRequest, NarrativeCompactor, NarrativeEmbedder, OutgoingMessageDraft, ScriptEntry, StatePatchProposal, StorySetting, StoryState, OverlaySnapshot, AlterSystemConfig, AgencyConfig, ScenePresenceState, ChatActionCapabilities, ChatReactionName, MessageReactionDraft, NativeFaceSemantic, QuotedMessageContext } from './types';
+import { SchedulePreplanConfig } from './schedule-preplan';
+import { InterludeArc, InterludeScene, InterludeParticipant, InterludeStory, NarrativeDecision, NarrativeFact, NarrativeIntent, GroupContext, NarrativeProvider, NarrativeRequest, NarrativeCompactor, NarrativeEmbedder, OutgoingMessageDraft, ScriptEntry, StatePatchProposal, StorySetting, StoryState, OverlaySnapshot, AlterSystemConfig, AgencyConfig, ScenePresenceState, ChatActionCapabilities, ChatReactionName, MessageReactionDraft, NativeFaceSemantic, QuotedMessageContext, SchedulePreplanRecord, TimelinePlan, UserReportedTime } from './types';
+/** Semantic recall is another view of raw history, so it must obey the same
+ * private-branch boundary as recentScript. Group transcripts are deliberately
+ * excluded from a private turn unless the owner opted into shared details. */
+export declare function isHistoryEntryVisibleToParticipant(entry: Pick<ScriptEntry, 'participantId' | 'kind'>, participantId: string, shareParticipantDetails: boolean): boolean;
+/** A turn needs a live query vector only for a feature that can actually use
+ * it. An inactive or small sticker library must not silently turn ordinary
+ * fact embedding into a per-message network request. */
+export declare function shouldRequestTurnEmbedding(embedding: ModelConfig['embedding'] | undefined, stickerLibraryEnabled: boolean, stickerCount: number): boolean;
 export interface Config {
     /** Immersive operation that suppresses HDSI visibility and Koishi commands. */
     blindMode?: BlindModeConfig;
@@ -22,6 +31,7 @@ export interface Config {
     stickers?: StickerLibraryConfig;
     alterSystem?: AlterSystemConfig;
     agency?: AgencyConfig;
+    schedulePreplan?: SchedulePreplanConfig;
 }
 export interface BlindModeConfig {
     enabled: boolean;
@@ -73,6 +83,8 @@ export interface StickerLibraryConfig {
     directory: string;
     maxFileSizeMB: number;
     catalogLimit: number;
+    /** API JSON mode is optional; prompt-only still asks for the compact JSON contract. */
+    descriptionResponseFormat?: 'json-object' | 'prompt-only';
 }
 export interface GroupChatRule {
     groupId: string;
@@ -97,6 +109,8 @@ export interface MemoryConfig {
     sceneHookCharacters: number;
     sceneSummaryCharacters: number;
     arcSummaryCharacters: number;
+    /** How many immediately-preceding closed scene summaries join the prompt. */
+    previousSceneSummaries: number;
     recentEntryLimit: number;
     factLimit: number;
     factContentCharacters: number;
@@ -144,6 +158,8 @@ export interface RuntimeConfig {
     minimumAdvanceMinutes: number;
     maxStoriesPerSweep: number;
     contextEntryLimit: number;
+    /** Preserve raw entries from this recent time window in addition to the count floor. */
+    contextTimeWindowMinutes?: number;
     memoryLimit: number;
     maxScriptCharacters: number;
     maxMessageCharacters: number;
@@ -160,6 +176,8 @@ export interface RuntimeConfig {
     typingBaseDelaySeconds?: number;
     typingCharactersPerSecond?: number;
     typingMaxDelaySeconds?: number;
+    /** Random variation applied to simulated typing delays; 0 keeps deterministic timing. */
+    typingJitterRatio?: number;
     /** Wait after the newest user message before starting a writing request. */
     userMessageDebounceSeconds?: number;
     /** @deprecated Ignored since 0.1.2; requests remain replaceable until the first reply is committed. */
@@ -291,7 +309,15 @@ export declare class InterludeService extends Service {
     private compactor;
     private embedder;
     private stickerDescriber;
+    private visionDescriber;
     private stickerCatalog;
+    /** Whole-table semantic recall cache, one map per story: entry id → vector +
+     * minimal content. Loaded lazily on first recall and extended incrementally
+     * by the background backfill; never persisted. */
+    private historyVectors;
+    private historyVectorsReady;
+    /** Per-story retry-after timestamps for failed Schedule Preplan generations. */
+    private schedulePreplanBackoff;
     private stickerById;
     private stickerScanRunning;
     /**
@@ -330,6 +356,18 @@ export declare class InterludeService extends Service {
     private sweepRunning;
     private compactionSweepRunning;
     private blindModeHealthIssue;
+    /** Console reload creates a new service instance, so normalized config can
+     * be cached safely for the lifetime of this instance. */
+    private cachedVoiceTranscriptionConfig?;
+    private cachedStickerConfig?;
+    private cachedAlterSystemConfig?;
+    private cachedAgencyConfig?;
+    private cachedSchedulePreplanConfig?;
+    private cachedBlindModeConfig?;
+    private cachedAutoAdvanceConfig?;
+    private cachedSharedStoryConfig?;
+    private cachedMemoryConfig?;
+    private cachedBrowserConfig?;
     constructor(ctx: Context, config: Config);
     private startBackgroundTasks;
     setNarrator(provider: NarrativeProvider): void;
@@ -397,6 +435,10 @@ export declare class InterludeService extends Service {
         createdAt: Date;
     }>;
     recentEntries(storyId: string, limit?: number): Promise<any[]>;
+    /** Live narration keeps both a count floor and a recent wall-clock window.
+     * A burst of conversation can therefore exceed the nominal turn count
+     * without immediately erasing everything said earlier in the same hour. */
+    private recentEntriesForPrompt;
     memories(storyId: string, limit?: number, participantId?: string): Promise<any[]>;
     /** Administrative view: includes global and participant-specific durable facts. */
     adminFacts(storyId: string, limit?: number): Promise<any[]>;
@@ -413,6 +455,13 @@ export declare class InterludeService extends Service {
     /** Clear only the evolving setting overlay; keep Canon, script and memories. */
     clearSettingOverlay(story: InterludeStory, target: 'character' | 'perspective' | 'relationship' | 'world' | 'all'): Promise<{
         participantCount: number;
+    }>;
+    /** Start a clean host-owned timeline without deleting the historical archive.
+     * This is intended once after upgrading from prose-authoritative releases
+     * whose active scene or scratchpad may already contain future contamination. */
+    rebaseTimeline(story: InterludeStory): Promise<{
+        at: Date;
+        sceneReset: boolean;
     }>;
     private clearSettingOverlayUnlocked;
     /**
@@ -461,22 +510,65 @@ export declare class InterludeService extends Service {
      */
     private bufferUserNarrative;
     private signalIncomingInterruption;
+    /** Experimental streaming path: only a complete, validated private reply
+     * may leave early. It commits the existing interruption boundary at the
+     * same moment as ordinary first-message delivery. */
+    private deliverEarlyPrivateReply;
     /** Extract structured image segments without treating them as a second event. */
     private get voiceTranscriptionConfig();
     private get stickerConfig();
     private describeUserEvent;
     private scanStickerLibrary;
     private refreshStickerCatalog;
+    private semanticStickerEmbeddingEnabled;
+    /** Vectorize described-but-unindexed sticker assets in the background. The
+     * batch stays small so one scan cannot spend more than a handful of calls. */
+    private backfillStickerEmbeddings;
     private stickerCatalogForSession;
+    /** Semantically narrow the sticker catalog to the entries most relevant to the
+     * live message. Falls back to the full catalog whenever the feature is off,
+     * the turn has no query vector, or the catalog is below the limit. */
+    private rankStickerAssets;
+    private semanticTurnEmbeddingEnabled;
+    /** Compact summaries of the scenes immediately before the active one. They
+     * bridge the raw context window and the arc, where last-turn details used to
+     * disappear from the prompt entirely. */
+    private previousSceneSummaries;
+    /** Drop expired scratchpad entries and cap the list; details only ever carry
+     * small in-flight facts, so silence is the correct treatment for expiry. */
+    private pruneWorkingDetails;
+    /** Semantic recall over the story's whole raw history. Vectors are loaded
+     * once per story into memory and extended incrementally by the backfill;
+     * entries already inside recentScript are excluded by id. */
+    private recallHistory;
+    /** Load every embedded entry of one story into the recall cache. The load is
+     * deliberately whole-table (no time window): older memories stay retrievable,
+     * and the per-process cache makes the cost one-off per story. */
+    private ensureHistoryVectors;
+    /** Drop in-memory copies whenever their source rows are removed or redacted.
+     * The next recall reloads only the surviving database rows. */
+    private invalidateHistoryVectors;
+    /** Background vectorization for semantic history recall. Newest entries go
+     * first so live-recall quality ramps up quickly; the whole table is covered
+     * gradually over successive maintenance passes. */
+    private backfillHistoryEmbeddings;
     private transcribeVoiceEvent;
     private describeVisionEvent;
     private loadNativeImages;
+    /** Sidecar vision mirrors native image acquisition, but sends only its
+     * factual result into the text narrator's current event. */
+    private describeCurrentImages;
     private fetchNativeImage;
     /** Convert adapter/fetched bytes into one bounded native-vision attachment.
      * Animated stickers are rendered to a representative PNG frame when the
      * optional Puppeteer service is available; otherwise the original image is
      * still passed through rather than inventing a description. */
     private imageBytesToNative;
+    /** Re-render a static image through Puppeteer capped at the configured vision
+     * dimension. Multimodal providers tile large images into many tokens, so a
+     * bounded re-encode saves both upload time and per-turn token cost; the
+     * browser also applies EXIF orientation, fixing rotated phone photos. */
+    private downscaleImageForVision;
     private renderAnimatedImageFrame;
     /** Prevent timers or already-returning model calls from resurrecting data
      * after an administrator resets the story or clears HDSI tables. */
@@ -486,7 +578,7 @@ export declare class InterludeService extends Service {
     private flushBufferedNarrative;
     advanceStory(story: InterludeStory, force?: boolean): Promise<OutgoingMessageDraft[]>;
     /** Used by commands/tests to deliver a mixed set of account-targeted actions safely. */
-    deliverMessages(story: InterludeStory, messages: OutgoingMessageDraft[], session?: Session): Promise<void>;
+    deliverMessages(story: InterludeStory, messages: OutgoingMessageDraft[], session?: Session): Promise<OutgoingMessageDraft[]>;
     compactStory(story: InterludeStory, force?: boolean): Promise<boolean>;
     /** Merge and compress already-applied overlay patches without running the
      * full scene/fact compaction pass. This is safe for manual maintenance. */
@@ -506,10 +598,21 @@ export declare class InterludeService extends Service {
     /** Refresh continuity only on the first automatic pass or every fifteenth
      * successful narrative write. Ordinary turns reuse the last snapshot. */
     private shouldRefreshContinuity;
+    /** Automatic prose no longer invents the world timeline by itself. The
+     * compaction route first returns a tiny relative-time ledger; if it cannot,
+     * preserving the current cursor is safer than writing an ungrounded future. */
+    private planAutomaticTimeline;
     private tryDecide;
     private persistDecision;
+    /** Keep the active-scene anchor in sync with the host ledger immediately,
+     * rather than waiting for prose compaction to reconcile an already-completed
+     * automatic window. */
+    private persistTimelineSceneAnchor;
+    adminSchedulePreplan(storyId: string): Promise<SchedulePreplanRecord>;
+    requestSchedulePreplanRebuild(storyId: string): Promise<boolean>;
     private get alterSystemConfig();
     private get agencyConfig();
+    private get schedulePreplanConfig();
     private get blindModeConfig();
     private emotionalOffsetForPrompt;
     private updateAlterSystem;
@@ -523,7 +626,7 @@ export declare class InterludeService extends Service {
      * signals instead of replacing them; a failed vector lookup simply has a
      * semantic score of zero for this turn.
      */
-    facts(storyId: string, limit?: number, query?: string, participantId?: string): Promise<any[]>;
+    facts(storyId: string, limit?: number, query?: string, participantId?: string, turnQueryEmbedding?: number[]): Promise<NarrativeFact[]>;
     /** Returns only observations that are safe for this narration branch. A
      * participant's browsing is not shown to another private participant unless
      * the owner has explicitly enabled shared relationship details. */
@@ -534,8 +637,7 @@ export declare class InterludeService extends Service {
     /** Active consequences share the intent table but are never scheduler work.
      * Their payload keeps the lifecycle explicit so old scheduled intents keep
      * their existing behaviour without a migration. */
-    private activeConsequences;
-    private expireActiveConsequences;
+    private activeConsequencesAndExpire;
     /** Only active consequences visible to the writer may be resolved. This
      * prevents a remote model from changing arbitrary future plans by id. */
     private applyIntentUpdates;
@@ -562,6 +664,7 @@ export declare class InterludeService extends Service {
     /** Persist a bounded retry so a transient provider failure cannot strand a user turn. */
     private scheduleNarrativeRetry;
     private dueIntents;
+    private upcomingNarrativeIntents;
     /** Wake the scheduler close to a short typing delay instead of waiting for
      * the normal background sweep. The due intent remains the source of truth. */
     private scheduleDueIntentWake;
@@ -583,8 +686,13 @@ export declare class InterludeService extends Service {
      * sending every reply back to the account that happened to trigger the turn.
      */
     private sendOutgoingMessages;
+    /** Confirm visible delivery only after the platform accepted the message.
+     * Failed attempts become explicit system evidence rather than fictional
+     * character speech, and deliberately do not auto-retry to avoid duplicates
+     * when an adapter fails after it has already accepted a request. */
+    private confirmOutgoingDeliveries;
+    private recordOutgoingDeliveryFailure;
     private resolveLiteralQuoteMessageId;
-    private recordLiteralQuoteTransport;
     /** Records only completed background deliveries. It is intentionally a
      * bounded action ledger, rather than a duplicate conversation transcript. */
     private recordAutomaticDelivery;
@@ -605,6 +713,7 @@ export declare class InterludeService extends Service {
      * a conversation. A delayed reply anchors them after its planned send time. */
     private scheduleConversationFollowUpsAfterTurn;
     private scheduleNextAutomaticAdvance;
+    private schedulePreplanAnchoredTime;
     private get sharedStoryConfig();
     private mainModelLabel;
     private participantPreset;
@@ -632,7 +741,27 @@ export declare class InterludeService extends Service {
     private ensureContinuity;
     private scheduleCompaction;
     private compactStories;
+    private getSchedulePreplan;
+    private schedulePreplanEvidence;
+    private saveSchedulePreplan;
+    private prepareSchedulePreplanReview;
+    /** Preplan has one small independent request instead of competing with
+     * scene/fact compression. One recovery retry is cheap and covers providers
+     * that occasionally omit an otherwise valid JSON object. */
+    private requestSchedulePreplan;
+    private persistSchedulePreplanReview;
+    /** A visible reply already reached the user, so this retry may write only
+     * the missing life script. It must never create a second transport message. */
+    private scheduleStreamScriptRecovery;
+    private persistStreamScriptRecovery;
     private compactUnlocked;
+    /** Everything up to the expensive compactor call: cheap reads plus the due
+     * checks. Runs inside the story serial queue, but the model call itself must
+     * not — a queued compactor request would delay the next live turn. */
+    private prepareCompaction;
+    /** Cheap DB persistence for one compaction decision. Re-acquires the story
+     * serial queue in the caller so writes stay ordered with narrative turns. */
+    private applyCompaction;
     /** Older state patches are compacted only by the background maintenance
      * lane. Live turns always retain the last few days as raw detail. */
     private compactOverlayUnlocked;
@@ -654,8 +783,13 @@ export declare class InterludeService extends Service {
     private reportOperation;
     private writeReport;
     private reportStandalone;
+    /** One Koishi log line per model call: token counts, cache hit rate and
+     * optional billing from the per-connection price fields. */
+    private reportTokenUsage;
     private reportStandaloneOperation;
     private writeStandalone;
+    private resolveCompactionFacts;
+    private markContinuityDirty;
     private emitLog;
     private reportBlindModeHealth;
     private allowsVerbosity;
@@ -669,6 +803,10 @@ export declare class InterludeService extends Service {
      */
     private dbRead;
     private dbGet;
+    /** Repair only a stale canonical story whose configured bot is no longer
+     * online. A live OneBot session is stronger evidence than historical story
+     * metadata, while a still-online story bot remains untouched. */
+    private repairCanonicalOneBotStoryTransport;
     private retryDbWrite;
     private dbCreate;
     private findPossiblyCommittedCreate;
@@ -694,9 +832,24 @@ export declare function mergeUserMessageWithVoiceTranscripts(text: string, trans
  * deliberately makes thresholds above 0.90 an effective near-disable mode.
  */
 export declare function calibratedNativeFaceWillingness(semantic: NativeFaceSemantic, willingness: unknown, replyContent: unknown): number;
+/** The old punctuation-only id could collide (for example two filenames that
+ * both normalize to bq--6-). Keep a readable path prefix, then append a
+ * content hash fragment so every row is globally unique and stable for an
+ * unchanged file. */
+export declare function stableStickerAssetId(filePath: string, hash: string): string;
+/** Extract only explicit clock statements from a live user message. This is a
+ * small factual aid, not an attempt to infer every temporal expression. */
+export declare function extractUserReportedTimes(content: string, now: Date, timezone: string): UserReportedTime[];
 export declare function describeQuotedMessage(session: Session, characterName?: string): QuotedMessageContext | undefined;
 export declare function normalizeQuotedMessageContent(value: unknown): string;
 export declare function normalizeAllowedReactions(value: unknown): ChatReactionName[];
+/** Parse only the narrow event ledger shape. Unknown model fields and empty
+ * plans are discarded before they can become a source of world state. */
+export declare function normalizeTimelinePlan(value: unknown): TimelinePlan | undefined;
+/** Automatic script prose is a rendering, not the next turn's temporal source.
+ * A compact host ledger retains the real sequence without letting a previous
+ * paragraph be copied into a new time window. */
+export declare function timelineEntryPromptProjection(entry: ScriptEntry): ScriptEntry;
 export declare function normalizeGroupChatActions(decision: NarrativeDecision, capabilities: ChatActionCapabilities | undefined, context: GroupContext): ExecutableGroupChatActions;
 export declare function formatGroupSpeaker(senderName: string, senderId: string): string;
 export declare function normalizeGroupVisibleReply(raw: NarrativeDecision['groupReply'], interaction: NarrativeDecision['interaction'], maxCharacters: number): string;
@@ -718,3 +871,14 @@ export declare function shouldSupersedeNarrativeRequest(inFlightRequestId: numbe
  * drivers and hot-reload paths can return ISO strings, so normalize every row
  * crossing the service boundary before time arithmetic or prompt building. */
 export declare function normalizeDatabaseRow(table: string, value: unknown): any;
+/** How many sticker descriptions a semantically filtered turn injects. */
+export declare const SEMANTIC_STICKER_LIMIT = 12;
+/** Pure ranking used by the semantic sticker filter. Assets without a vector
+ * still fill remaining slots after the embedded ones so a half-indexed library
+ * degrades gracefully instead of hiding entries. */
+export declare function rankStickerCatalog<T extends {
+    embedding?: number[];
+}>(assets: T[], queryEmbedding: number[], limit: number): T[];
+/** Only static raster images worth the re-render enter Puppeteer downscaling:
+ * tiny images would not shrink further and animated ones have their own path. */
+export declare function shouldDownscaleImage(mimeType: string, dataUri: string): boolean;

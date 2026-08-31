@@ -1,5 +1,68 @@
 # 版本记录
 
+## 0.1.4
+
+- 正式化宿主时间轴：自动回合以已完成 timeline ledger 为导演输入，自动完成后立即同步活跃场景锚点与 host-owned timeline carry，避免相邻自动推进重复选择同一生活事件。
+- 当前用户事件新增本地接收时间与用户明确陈述的动作时钟；历史条目同步提供本地发生时间，区分“现在收到消息”与“用户报告过去在某时做过某事”。
+- 修复 Schedule Preplan 首次无证据时的空结果死循环：持久化“已审查、暂无线索”的空记录；共享剧本隐私模式下从安全的自动时间账本读取日程证据。
+- 修复本地表情包扫描的 ID 冲突与单素材失败阻断；表情包描述支持 `json-object` 与 `prompt-only` 两种返回格式。
+- 正式提供侧端识图、时间线重基准、稳定时区时间显示与 Token 用量日志；同步完善部署、配置、新手、命令、架构与开发文档。
+
+## 0.1.4-beta7-reimagine
+
+- 自动推进、对话后续和到期意图改为“时间导演 → 主叙事渲染”双层流程：复用压缩模型先生成 1–4 个位于当前真实窗口内的相对时间 beats；无有效事件账本时保留游标等待重试，不让自由 prose 决定世界时间。
+- 自动剧本把已验证的 timelinePlan 写入元数据；后续上下文投影使用事件账本而非上一段 prose，压缩器也会读取该账本作为自动窗口内事实的优先来源。
+- 修复 cache-first 的 `recentExchange` 会重复 script prose 的问题；尾部锚点现在只包含真实收发消息与已投递动作。
+- workingDetails 与压缩合约收紧为“当前具体状态”，明确排除未来检查、预测、期待和未发生截止点。
+- 新增 `interlude.timeline.rebase`：为旧版本受未来误写污染的故事从当前真实时间重建活跃时间线，不删除历史剧本与长期事实。
+- 新增可选侧端识图模式：纯文本主模型可通过 `vision.mode=sidecar` 与 `useForVision` 视觉连接接收当前图片的临时事实观察，图片与观察均不持久化。
+- 本地表情包描述新增 `stickers.descriptionResponseFormat`：可手动选择 `json-object` 或 `prompt-only`；后者不发送 API JSON mode，仍保留提示词 JSON 合约与宽容解析。
+- 修复本地表情包扫描的素材 ID 冲突：ID 改为规范化路径与内容哈希组合；单个素材的读取、数据库写入或描述失败会单独记录并继续扫描其余素材。
+
+## 0.1.4-beta6-reimagine
+
+- 分段消息的模拟打字延迟加入默认 ±30% 抖动；`typingJitterRatio=0` 可恢复固定节奏。
+- 主叙事 JSON 合约改为可见 transport 字段在前、script 在后，为流式首条投递提供协议基础。
+- 新增 `model.mainStreamingMode=experimental`：仅在 `json-object` 下尝试解析完整私聊 `interaction.reply` 并提前投递；群聊继续等待完整结果。
+- 智谱官方 SSE 与 OpenAI Chat Completions SSE 均具备实验性解析路径。首条成功投递后若流式收尾失败，保留已发送消息、记录系统事件，并禁止可见 failover 重发。
+- README、配置指南、部署教程和一条龙向导增加兼容模型范围、手动开关及风险说明。
+- 新增 `model.mainPayloadOrder=cache-first`：主叙事 payload 按变异频率重排，对话历史与低频记忆层前置、每轮变化字段（当前事件、时钟、状态）后置，使支持前缀缓存的服务商（DeepSeek/GLM/Kimi 等）跨轮命中稳定前缀，显著降低连续对话的输入成本与 prefill 延迟。
+- cache-first 模式在 payload 末尾新增 `recentExchange` 最近交换块（最多 3 条、1600 字符、排除当前消息），把最后几条交互重新锚定在生成点旁；固定合约同步说明该块是既定过去的强调而非新事件。默认 `legacy` 逐字节保持历史顺序。
+- 固定合约瘦身：删除两条被其它规则完全覆盖的重复行、修剪两句纯氛围/重复半句，并把 refreshContinuity 的双变体合并为单一恒定行——系统提示自此跨全部轮次逐字节一致，refresh 轮不再击穿前缀缓存；非刷新轮合约缩短 251 字符、refresh 轮缩短 445 字符，语义与安全约束无删减。
+- cache-first 模式的 recentScript 条目元数据压缩：kind/actor/participantId 三元组折叠为单个紧凑标签（protagonist / protagonist-narration / protagonist(group) / protagonist(action) / user / group-member / system），participantId 仅在历史真正跨越多个关系分支时保留；固定合约同步提供标签图例。实测每轮节省约 2-3k tokens。
+- 贴纸目录语义过滤：`embedding.semanticStickerFilter` 默认开启，按当前消息的向量相似度只注入最相关的 12 条贴纸描述；素材描述与别名在后台自动向量化（每次扫描最多补齐 8 条），Embedding 不可用时回退全量目录。
+- 视觉输入降采样：`vision.maxImageDimension`（默认 1024，可选 0/512/768/1024）通过可选 Puppeteer 服务重渲染图片，节省多模态 token 与上传时间并顺带修正 EXIF 旋转；Puppeteer 不可用、动图或小于 150KB 的图片自动透传原图。
+- 记忆缝隙根治：`memory.previousSceneSummaries`（默认 2）把紧邻已关闭场景的摘要（每条裁剪至 2000 字符、带时间范围）并入主提示词的场景上下文，填补 30-50 条原始窗口与弧线摘要之间的信息黑洞；`contextEntryLimit` 默认由 20 提升至 50（受 12k 字符预算约束，与 cache-first 搭配时增量近乎免费）。
+- 新增 Token 用量与计费日志：每次主叙事/压缩/Overlay 整理/Alter 分析/贴纸描述调用后输出一行 `Token 用量[任务]`，包含输入、缓存命中（与命中率）、输出；在模型连接上配置 `priceInput` / `priceOutput` / `priceCachedInput`（每百万 tokens 单价）后，同一行还会输出计费合计与缓存节省。用量聚合跨 failover 尝试与恢复重写（每次重试消耗的 token 都会计入）；流式路径从流内 `usage` 块读取，服务商未报告 usage 时该次调用自动省略用量段。
+- 修复 Schedule Preplan 每轮重试风暴与消息延迟：生成失败后 2 小时内不再重试（此前弱压缩模型省略 schedulePreplan 字段会导致每个用户回合后都触发一次迷你整理）；压缩模型调用移出故事串行队列（prepare → 队列外 LLM → 重新入队落库），用户消息不再排队等待压缩完成；压缩合约补充首次创建指引（current 为 null 时必须返回 schedulePreplan）。
+- 修复上一条拆分方案引入的串行队列自死锁：promise 链式队列内嵌套 `serial(同一故事)` 会让整理任务与落库任务互相等待，整条故事队列永久卡死（后续消息只有接收日志、永不回复）。现在三阶段全程无嵌套，模型调用在队列外执行。
+- Console 描述统一（subtle 文案微调）：请求管线统一称"主叙事"、连接对象统一称"连接"；功能总开关统一"启用 X：…"句式、行为修饰开关统一"是否…"；vision 分区与字段描述去重；计费第三项措辞与前两项对齐；配置指南 memory 小节编号修正（8.x→10.x）。仅描述文本，无任何行为变更。
+- 修复 strictNullChecks 关闭配置下 PreparedCompaction 可辨识联合的布尔判别式不收窄问题，改为字符串判别式（phase: 'skip' | 'run'）。
+- 新增 workingDetails 工作暂存：场景压缩在整理时提取"取餐码、代购、跑腿"这类小型在途细节（`{label, value, expiresAt}`，去重合并、上限 10 条、默认 6 小时过期），存于故事状态并随主提示词稳定区注入；主合约要求模型安静地作为背景使用、绝不逐条复述，过期自然淡出。
+- 新增历史语义召回：`embedding.semanticHistory`（默认关闭）将剧本条目在后台向量化（最新优先、渐进覆盖全表、无时间窗），故事级内存向量缓存一次加载、增量扩充；实时回合按当前消息检索最相关的 3 条旧片段注入 `recalledHistory` 回忆块（排除原始窗口内条目，内容与 recentScript 同源清洗）。查询向量全轮统一：贴纸过滤、事实语义排序与历史召回共享一次 Embedding 请求。
+
+## 0.1.4-beta5
+
+- 新增独立的 Schedule Preplan：压缩模型基于近期剧本证据维护生活阶段、周规律和日期例外，程序确定性展开未来 14 天。
+- 每天在本地空闲时检查一次；覆盖充足且没有新证据时不调用模型，需要建立、续写或调整时复用 `useForCompaction`，并尽量与场景压缩合并。
+- 主叙事只接收从当前时刻起未来约 12 小时、最多八项计划块；提示词明确计划不是已发生事实，真实事件与剧本优先。
+- 固定日程的开始/结束可成为自动推进锚点；新增 `interlude.schedule`、`interlude.schedule.rebuild`、Console 配置和独立设计文档。
+- 近期上下文改为条目下限与时间窗口的并集：默认至少 20 条，并保护最近 60 分钟内的真实用户/角色消息。
+- Continuity 不再持久化或注入自由文本 `next`；未来计划改由 pending intent、到期事项和 Schedule Preplan 动态提供。
+- Fact 生命周期支持 `resolvesFactIds` 和显式 `unresolved=false`；最近已完成事件与未完成承诺各有固定检索通道，unresolved 排序加分只作用于 promise。
+- 承诺、active consequence 或开放事实完成后标记 continuity 提前刷新，不再机械等待第 15 次写作。
+
+## 0.1.4-beta4
+
+- 保留当前消息同时作为持久事件与 `currentEvent` 的现有叙事语义，并增加回归测试防止未来误删；本版不实施事件去重。
+- 合并剧情余波的到期清理与有效项读取，单次主叙事只扫描一次 pending intent；Memory 关闭时跳过 memories、facts 与 Overlay 查询。
+- Alter 达到阈值后仍在首次后台调度机会立即分析；Overlay 与场景压缩一旦启动也继续完成，保证连续对话不会无限推迟状态沉淀与记忆整理。
+- 配置默认值与模型 provider 路由改为插件生命周期内只规范化一次，减少实时热路径上的重复对象构建和提供商筛选。
+- 延续群聊可靠性修复：群投递优先使用当前 session bot，过期主剧本投递账号可自愈；多段消息会按实际成功段落记录，表情动作只有发送成功才消耗群聊意愿，并要求模型显式返回 `groupReply:none`。
+- 私聊、到期消息与自动联系改为投递成功后才确认 `character-message`、角色消息时间和后续分段；失败内容只写入“未投递”系统诊断，不自动重发，避免短暂适配器异常把虚构发言写回剧情或造成重复消息。
+- DeepSeek 官方模式新增独立思考开关和 `low` / `high` / `max` 思考强度；默认关闭思考，开启后才写入官方请求参数。
+- 同步 README、配置、新手、部署、命令、安全、架构与开发文档；补充 Koishi Desktop 的 Yarn 本地包安装方式、表情包描述模型字段，并将 README 链接的文档索引纳入 npm 包。
+
 ## 0.1.4-beta3
 
 - 入站 QQ 原生表情现在会在私聊、群聊与引用内容中翻译为稳定语义文字；经典系统表情复用 QFace 表，并补齐当前具名新增表情。未知未来 ID 保留“名称未收录”标记，不再交由模型猜测。

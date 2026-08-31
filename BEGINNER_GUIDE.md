@@ -1,6 +1,6 @@
 # HDS Interlude 新手引导
 
-适用版本：`0.1.4-beta3`
+适用版本：`0.1.4`
 
 HDS Interlude 是 Koishi 的持续叙事聊天插件。插件使用共享主剧本保存角色状态、关系分支、已发生事件、待处理计划和长期记忆。用户消息会进入当前活动场景；主模型在同一次请求中续写已经发生的生活，并决定是否发送、延迟发送或暂不发送消息。实时写作读取一条按时间排序的活动场景记录：最近剧本文字、真实用户消息和已经成功投递的角色消息在同一条线上。剧本引子、场景外近期事实和长期记忆负责更早的历史。
 
@@ -14,7 +14,7 @@ HDS Interlude 是 Koishi 的持续叙事聊天插件。插件使用共享主剧�
 ## 首次配置
 
 1. 在 Koishi Console 启用 `hds-interlude`。
-2. 在“模型与服务商”中配置 OpenAI Chat Completions 兼容服务商，并在主叙事模型位置选择一个模型预设。
+2. 在“模型与服务商”中添加一行模型连接，选择对应的 `mode`，填写该模式需要的连接信息，并勾选 `useForMain`。
 3. 在“剧本起点”中填写主角资料、默认关系、世界设定、地点、时区和叙事风格。
 4. 使用 OneBot/NapCat 时，在 `onebot.botAccounts` 填写机器人 QQ；在 `onebot.userAccounts` 逐项填写允许私聊的测试 QQ、人物资料和初始关系。
 5. 保存配置后，在已授权私聊中执行：
@@ -24,7 +24,7 @@ interlude.doctor
 interlude.story.start
 ```
 
-Console 页面建议按以下顺序填写：`blindMode`（首次保持关闭）→ `storyDefaults` → `model` → `onebot` → `sharedStory` → `runtime` → `agency` → `memory` → `alterSystem`。首次测试先完成模型、剧本起点和账号权限；网页观察、Embedding、详细日志与失明模式可以之后再开。
+Console 页面建议按以下顺序填写：`blindMode`（首次保持关闭）→ `storyDefaults` → `model` → `onebot` → `chatActions` → `stickers` → `sharedStory` → `runtime` → `schedulePreplan` → `agency` → `memory` → `alterSystem`。首次测试先完成模型、剧本起点和账号权限；网页观察、Embedding、详细日志与失明模式可以之后再开。
 
 6. 发送一条普通消息，确认模型调用、日志和消息投递正常。
 
@@ -36,7 +36,8 @@ Console 页面建议按以下顺序填写：`blindMode`（首次保持关闭）�
 2. 在两秒内发送多条短消息，确认它们只产生一次主模型写作回合。
 3. 测试延迟回复：用户再次发言后，旧延迟计划应取消并重新判断。
 4. 开启 `runtime.autoAdvanceEnabled`，使用 `interlude.advance` 检查自动回合的剧本和消息行为。
-5. 将两个 QQ 加入白名单，确认它们共享主剧本且各自保留关系资料。
+5. 等待一次后台空闲整理后使用 `interlude.schedule`，确认主提示词只会投影未来约半天的 Schedule Preplan。
+6. 将两个 QQ 加入白名单，确认它们共享主剧本且各自保留关系资料。
 
 ## 推荐配置预设
 
@@ -50,6 +51,7 @@ model.mainTopP: 1
 model.mainMaxTokens: 4096
 model.mainTimeout: 60000
 model.mainResponseFormat: json-object
+model.mainStreamingMode: off # 确认服务商支持 SSE JSON 后，才改为 experimental
 model.formatPrompt: ''
 model.fixedPrompt: ''
 model.failover.enabled: true
@@ -57,10 +59,10 @@ model.failover.strategy: priority
 model.failover.maxAttemptsPerProvider: 2
 model.failover.cooldownMinutes: 5
 model.embedding.enabled: false
-model.vision.enabled: false # 只有视觉模型才改为 true
+model.vision.enabled: false # 视觉主模型用 native；纯文本主模型可改为 true 并配置 sidecar + useForVision
 ```
 
-主叙事读取 `runtime.contextEntryLimit` 控制的近期原始条目，并受固定 12,000 字符预算保护；更早内容由 continuity、场景摘要和长期事实衔接。
+主叙事把 `runtime.contextEntryLimit` 的条目下限与 `contextTimeWindowMinutes` 的时间窗口取并集。默认至少保留 50 条，并额外保护最近 60 分钟的真实用户/角色消息；普通剧本文字仍受固定字符预算约束。更早内容由 continuity、场景摘要和长期事实衔接。
 
 
 每条模型连接只配置一次；用用途开关决定它服务哪些任务：
@@ -173,15 +175,22 @@ runtime.messageSeparator: '<sep/>'
 runtime.typingBaseDelaySeconds: 1
 runtime.typingCharactersPerSecond: 8
 runtime.typingMaxDelaySeconds: 12
+runtime.typingJitterRatio: 0.3
 runtime.narrativeRetryDelaySeconds: 60
 runtime.narrativeRetryMaxAttempts: 6
-runtime.contextEntryLimit: 30
+runtime.contextEntryLimit: 50
+runtime.contextTimeWindowMinutes: 60
 runtime.memoryLimit: 20
 
 runtime.autoAdvanceEnabled: true
 runtime.autoAdvanceIntervalMinutes: 40
 runtime.autoAdvanceJitterMinutes: 5
 runtime.conversationFollowUpMinutes: [10, 20]
+
+schedulePreplan.enabled: true
+schedulePreplan.horizonDays: 14
+schedulePreplan.reviewAfterLocalHour: 3
+schedulePreplan.anchorAutoAdvance: true
 runtime.conversationFollowUpJitterMinutes: 1
 runtime.allowProactiveMessages: false
 runtime.proactiveWillingnessThreshold: 0.65
@@ -260,13 +269,13 @@ logging.logMessageContent: false
 ## 常用管理指令
 
 - `interlude.status`：查看当前主剧本状态。
-- `interlude.context`：查看活动场景写作源、待处理事件、近期逻辑回合、剧本引子、近期事实、关系状态和长期事实。
+- `interlude.context`：查看运行上下文摘要，包括活动场景、关系状态、Overlay 与长期事实；它不是主模型请求 payload 的逐字段原样输出。
 - `interlude.timeline`：查看当前账号相关的近期剧本条目。
 - `interlude.memory.intents`：查看延迟回复、提醒、承诺和剧情余波。
 - `interlude.pause` / `interlude.resume`：暂停或恢复后台处理。
 - `interlude.overlay.status`：查看当前 overlay、待积累提案和压缩快照。
 - `interlude.overlay.compact`：只合并/压缩已经应用的 overlay。
-- `interlude.overlay.clear character|relationship|world|all`：清理指定类型的设定演化覆盖层；执行后按提示确认，同时会使相关待积累候选失效。
+- `interlude.overlay.clear character|perspective|relationship|world|all`：清理指定类型的设定演化覆盖层；执行后按提示确认，同时会使相关待积累候选失效。
 
 overlay 不会因为一次聊天就改变人格。普通变化需要多个剧本回合和不同日期的证据；短期影响继续保留在原始剧本、continuity 或剧情余波中，只有稳定变化才会进入长期 overlay。
 

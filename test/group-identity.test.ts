@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { systemPrompt, toPromptPayload } from '../src/narrator'
-import { calibratedNativeFaceWillingness, describeQuotedMessage, formatGroupSpeaker, normalizeAllowedReactions, normalizeGroupChatActions, normalizeQuotedMessageContent } from '../src/service'
+import { calibratedNativeFaceWillingness, describeQuotedMessage, formatGroupSpeaker, InterludeService, normalizeAllowedReactions, normalizeGroupChatActions, normalizeQuotedMessageContent } from '../src/service'
 import { ChatActionCapabilities, emptyStorySetting, emptyStoryState, GroupContext, InterludeStory, NarrativeDecision, NarrativeRequest } from '../src/types'
 
 test('group speaker labels retain both display name and stable QQ identity', () => {
@@ -105,4 +105,97 @@ test('quoted context is conditional and remains separate from the new message', 
   assert.doesNotMatch(ordinaryPrompt, /CURRENT EVENT QUOTE/)
   assert.match(quotedPrompt, /quoted text as a second incoming message/)
   assert.match(quotedPrompt, /never change its author/)
+})
+
+const transportStory: InterludeStory = {
+  id: 'character:onebot:old-bot', platform: 'onebot', selfId: 'old-bot', userId: '', channelId: 'group:100', status: 'active',
+  setting: emptyStorySetting(), state: emptyStoryState(), cursorAt: new Date('2026-08-28T00:00:00.000Z'),
+  createdAt: new Date('2026-08-28T00:00:00.000Z'), updatedAt: new Date('2026-08-28T00:00:00.000Z'),
+}
+
+test('group delivery uses the bot from the live session before stale story transport metadata', async () => {
+  const sentBySession: unknown[][] = []
+  const sentByStaleBot: unknown[][] = []
+  const service = {
+    ctx: { bots: [{ selfId: 'old-bot', platform: 'onebot', sendMessage: async (...args: unknown[]) => sentByStaleBot.push(args) }] },
+    splitOutgoingMessage: () => ['你好'],
+    report: () => undefined,
+  }
+  const liveSession = { bot: { sendMessage: async (...args: unknown[]) => sentBySession.push(args) } }
+  const sendGroupMessage = (InterludeService.prototype as any).sendGroupMessage
+  const delivered = await sendGroupMessage.call(service, transportStory, 'group:100', '你好', undefined, liveSession)
+
+  assert.deepEqual(delivered, { deliveredSegments: ['你好'], complete: true })
+  assert.deepEqual(sentBySession, [['group:100', '你好']])
+  assert.deepEqual(sentByStaleBot, [])
+})
+
+test('stale OneBot transport repairs only when its configured account is no longer online', async () => {
+  const updates: unknown[][] = []
+  const warnings: unknown[][] = []
+  const repair = (InterludeService.prototype as any).repairCanonicalOneBotStoryTransport
+  const offlineService = {
+    ctx: { bots: [] },
+    dbSet: async (...args: unknown[]) => { updates.push(args) },
+    reportStandalone: (...args: unknown[]) => { warnings.push(args) },
+  }
+  const repaired = await repair.call(offlineService, transportStory, { platform: 'onebot', selfId: 'new-bot' })
+  assert.equal(repaired.platform, 'onebot')
+  assert.equal(repaired.selfId, 'new-bot')
+  assert.equal(updates.length, 1)
+  assert.equal(warnings.length, 1)
+
+  const activeService = {
+    ctx: { bots: [{ selfId: 'old-bot', platform: 'onebot' }] },
+    dbSet: async () => { throw new Error('a live configured bot must not be rewritten') },
+    reportStandalone: () => { throw new Error('a live configured bot must not warn') },
+  }
+  const unchanged = await repair.call(activeService, transportStory, { platform: 'onebot', selfId: 'new-bot' })
+  assert.equal(unchanged, transportStory)
+})
+
+test('a failed segment makes group delivery incomplete, even when an earlier segment arrived', async () => {
+  const deliveredSegments: string[] = []
+  const service = {
+    ctx: { bots: [] },
+    splitOutgoingMessage: () => ['第一段', '第二段'],
+    report: () => undefined,
+  }
+  const liveSession = { bot: { sendMessage: async (_channelId: string, content: string) => {
+    deliveredSegments.push(content)
+    if (content === '第二段') throw new Error('network interruption')
+  } } }
+  const sendGroupMessage = (InterludeService.prototype as any).sendGroupMessage
+  const delivered = await sendGroupMessage.call(service, transportStory, 'group:100', '第一段<sep/>第二段', undefined, liveSession)
+
+  assert.deepEqual(delivered, { deliveredSegments: ['第一段'], complete: false })
+  assert.deepEqual(deliveredSegments, ['第一段', '第二段'])
+})
+
+test('private visible messages are confirmed only after transport, while failed drafts stay system-owned', async () => {
+  const entries: any[] = []
+  const characterUpdates: string[] = []
+  const service = {
+    serial: async (_storyId: string, task: () => Promise<void>) => task(),
+    getParticipant: async (id: string) => ({ id }),
+    appendEntry: async (_storyId: string, entry: any) => { entries.push(entry) },
+    recordCharacterMessage: async (participant: { id: string }) => { characterUpdates.push(participant.id) },
+    recordAutomaticDelivery: async () => undefined,
+    typingDelayMilliseconds: () => 100,
+    appendIntent: async () => undefined,
+    scheduleDueIntentWake: () => undefined,
+    config: { runtime: { maxMessageCharacters: 1_000 } },
+  }
+  const confirm = (InterludeService.prototype as any).confirmOutgoingDeliveries
+  const recordFailure = (InterludeService.prototype as any).recordOutgoingDeliveryFailure
+  await confirm.call(service, transportStory, [{ participantId: 'user', content: '已经送达', interaction: { seen: true, reply: { mode: 'immediate', content: '已经送达' } } }])
+  await recordFailure.call(service, transportStory, 'user', { participantId: 'user', content: '未送达' }, 'transport-error')
+
+  assert.equal(entries[0].kind, 'character-message')
+  assert.equal(entries[0].actor, 'character')
+  assert.equal(entries[0].content, '已经送达')
+  assert.equal(entries[1].kind, 'outgoing-delivery-failed')
+  assert.equal(entries[1].actor, 'system')
+  assert.match(entries[1].content, /未送达/)
+  assert.deepEqual(characterUpdates, ['user'])
 })

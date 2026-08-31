@@ -68,6 +68,14 @@ export function formatLogTime(value: Date | null | undefined, timezone: string) 
   }).format(value)
 }
 
+/** Human-facing command output: unlike logs, include the configured story
+ * timezone offset so copied timeline records never look like UTC. */
+export function formatStoryDisplayTime(value: Date | null | undefined, timezone: string) {
+  if (!value || Number.isNaN(value.getTime())) return '-'
+  const context = storyLocalTimeContext(value, timezone)
+  return `${context.local} ${context.offset || 'GMT+0'}`
+}
+
 export function localClockMinutes(value: Date, timezone: string) {
   const parts = formatter('clock', 'en-GB', timezone, {
     hour: '2-digit', minute: '2-digit', hourCycle: 'h23',

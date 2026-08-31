@@ -559,7 +559,7 @@
       <h1><span>HDS</span> Interlude</h1>
       <button class="theme-toggle" id="themeToggle" type="button" title="切换亮暗配色">☾</button>
     </div>
-    <p>从零到能聊天 · 0.1.4-beta3-enhanced 配置向导</p>
+    <p>从零到能聊天 · 0.1.4 配置向导</p>
   </div>
   <div class="steps" id="stepNav"></div>
   <div class="progress-wrap">
@@ -779,19 +779,19 @@ npm install</pre></div>
 <!-- ── Step 5 插件安装 ── -->
 <section class="step-page" data-step="5">
   <h2>第 5 步 · 安装插件</h2>
-  <p class="subtitle">安装完整 Koishi Console 基线、OneBot 适配器，并使用随部署材料提供的 HDSI 0.1.4-beta3 安装包。</p>
+  <p class="subtitle">安装完整 Koishi Console 基线、OneBot 适配器，并使用随部署材料提供的 HDSI 0.1.4 安装包。</p>
 
   <div class="card">
-    <h3>下载并安装 0.1.4-beta3 <span class="tag">本向导适用版本</span></h3>
-    <p>先从本次发布页的 Assets 下载 <code>koishi-plugin-hds-interlude-0.1.4-beta3.tgz</code>，放到固定位置，例如 <code>C:\Downloads</code>。随后确认 PowerShell 位于<strong>含 package.json 的 Koishi 项目根目录</strong>（例如 <code>C:\hds-bot</code>），运行：</p>
+    <h3>下载并安装 0.1.4 <span class="tag">本向导适用版本</span></h3>
+    <p>先从本次发布页的 Assets 下载 <code>koishi-plugin-hds-interlude-0.1.4.tgz</code>，放到固定位置，例如 <code>C:\Downloads</code>。随后确认 PowerShell 位于<strong>含 package.json 的 Koishi 项目根目录</strong>（例如 <code>C:\hds-bot</code>），运行：</p>
     <div class="cmd-block"><button class="copy-btn">复制</button><pre>cd C:\hds-bot
 npm install @koishijs/plugin-actions @koishijs/plugin-analytics @koishijs/plugin-commands @koishijs/plugin-config @koishijs/plugin-console @koishijs/plugin-explorer @koishijs/plugin-help @koishijs/plugin-http @koishijs/plugin-insight @koishijs/plugin-locales @koishijs/plugin-logger @koishijs/plugin-market @koishijs/plugin-notifier @koishijs/plugin-oobe @koishijs/plugin-proxy-agent @koishijs/plugin-sandbox @koishijs/plugin-status koishi-plugin-dataview koishi-plugin-rate-limit koishi-plugin-telemetry koishi-plugin-theme-vanilla
 npm install koishi-plugin-adapter-onebot
-npm install --save-exact "C:\Downloads\koishi-plugin-hds-interlude-0.1.4-beta3.tgz"</pre></div>
+npm install --save-exact "C:\Downloads\koishi-plugin-hds-interlude-0.1.4.tgz"</pre></div>
     <ul>
       <li>第一条命令补齐 Koishi 的配置、插件市场、资源浏览、数据查看、通知、状态与主题模块；无论脚手架初始选项如何，Console 都会保留完整管理页面</li>
       <li><code>koishi-plugin-adapter-onebot</code>：让 Koishi 通过 SnowLuma 收发 QQ 消息</li>
-      <li><code>koishi-plugin-hds-interlude-0.1.4-beta3.tgz</code>：HDSI 测试版安装包；本向导中的表情包和聊天动作配置以此版本为准</li>
+      <li><code>koishi-plugin-hds-interlude-0.1.4.tgz</code>：HDSI 正式版安装包；本向导中的表情包、侧端识图、时间线与聊天动作配置以此版本为准</li>
     </ul>
     <div class="notice warn">⚠ 请勿在 <code>C:\Users\你的用户名</code> 等非项目目录运行安装命令，否则包装到了错误位置，Koishi 不会加载它。</div>
     <p class="muted">最后确认数据库插件：脚手架一般自带；没有的话运行 <code>npm install @koishijs/plugin-database-sqlite</code>，已装会很快完成。</p>
@@ -799,7 +799,7 @@ npm install --save-exact "C:\Downloads\koishi-plugin-hds-interlude-0.1.4-beta3.t
 
   <div class="card">
     <h3>为什么不使用插件市场？</h3>
-    <p class="muted">插件市场的公开版本可能落后于本向导。为了让生成的配置与插件能力完全一致，请固定安装上面的 <code>0.1.4-beta3</code> 安装包。</p>
+    <p class="muted">插件市场的公开版本可能落后于本向导。为了让生成的配置与插件能力完全一致，请固定安装上面的 <code>0.1.4</code> 安装包。</p>
   </div>
 </section>
 
@@ -851,6 +851,7 @@ npm install --save-exact "C:\Downloads\koishi-plugin-hds-interlude-0.1.4-beta3.t
       <tr><td><b>Alter 分析</b></td><td>纯文本输出即可；只在情绪累计触发时调用一次，低频</td><td>同上，用便宜模型</td></tr>
       <tr><td><b>Embedding</b></td><td><b>必须支持 /embeddings 接口</b>，普通聊天模型不能勾</td><td>text-embedding-3-small 等向量模型</td></tr>
       <tr><td><b>表情包描述</b></td><td><b>必须能识图</b>的视觉模型</td><td>各家多模态模型</td></tr>
+      <tr><td><b>侧端识图</b></td><td>主叙事是纯文本模型时，用视觉模型把当前图片转成临时观察</td><td>Gemini、Qwen-VL、GLM-V 等视觉模型</td></tr>
     </table>
     <div class="notice info">💡 一条勾选“主叙事”的模型即可开始；建议再配置后台压缩。Alter、Embedding 和表情包都可以以后按需开启。Embedding 只能单独占一条连接，勾选后其它用途会自动取消。</div>
   </div>
@@ -865,7 +866,12 @@ npm install --save-exact "C:\Downloads\koishi-plugin-hds-interlude-0.1.4-beta3.t
 
   <div class="card">
     <h3>图片理解（可选）</h3>
-    <label class="check-line"><input type="checkbox" id="f_vision"> 开启图片理解（vision）——仅当所有勾选“主叙事”的模型都支持视觉输入时开启；故障切换模型也会收到图片。纯文本模型请保持关闭。</label>
+    <label class="check-line"><input type="checkbox" id="f_vision"> 开启图片理解（vision）</label>
+    <div class="field inline" style="margin-top:12px;">
+      <div><label>图片理解方式</label><select id="f_visionMode"><option value="native">native：主叙事模型直接识图</option><option value="sidecar">sidecar：独立视觉模型描述图片</option></select></div>
+      <div><label>图片细节</label><select id="f_visionDetail"><option value="auto">auto</option><option value="low">low（更省 token）</option><option value="high">high（适合细小文字）</option></select></div>
+    </div>
+    <p class="muted">主叙事模型支持视觉时选 native；纯文本主模型选 sidecar，并在下方模型用途中勾选一条“侧端识图”视觉模型。图片与识别结果都不会写入记忆。</p>
   </div>
 
   <div class="card">
@@ -877,6 +883,14 @@ npm install --save-exact "C:\Downloads\koishi-plugin-hds-interlude-0.1.4-beta3.t
         <option value="prompt-only">prompt-only（模型不支持 JSON mode 时使用）</option>
       </select>
       <div class="hint">这是唯一影响主叙事的输出格式；模型卡片中的格式仅供压缩、Alter 等后台任务使用。</div>
+    </div>
+    <div class="field">
+      <label>实验性流式首条回复</label>
+      <select id="f_mainStreamingMode">
+        <option value="off">关闭（默认）</option>
+        <option value="experimental">experimental（仅确认 SSE JSON 兼容后开启）</option>
+      </select>
+      <div class="hint">仅私聊、仅 json-object。未知中转站请先关闭；开启后可更早投递首条回复，但流式收尾失败时不会自动重发可见消息。</div>
     </div>
   </div>
 
@@ -1021,6 +1035,7 @@ npm install --save-exact "C:\Downloads\koishi-plugin-hds-interlude-0.1.4-beta3.t
       <label class="check-line"><input type="checkbox" id="f_messageReactions" checked> <span><b>贴表情回应</b>——给消息贴一个表情反应（QQ 群聊）</span></label>
       <label class="check-line"><input type="checkbox" id="f_nativeFaces" checked> <span><b>原生小表情</b>——聊天中发送 QQ 自带的小黄脸表情</span></label>
       <label class="check-line"><input type="checkbox" id="f_stickers"> <span><b>本地表情包库</b>——从表情包目录里挑图发送（同时需要在模型中心勾选一条能识图的“表情包”模型；素材放入 data/hds-interlude/stickers）</span></label>
+      <div class="field" style="margin:10px 0 0 28px;"><label>表情包描述返回格式</label><select id="f_stickerFormat"><option value="json-object">json-object（默认）</option><option value="prompt-only">prompt-only（模型 JSON mode 不稳定时）</option></select><div class="hint">prompt-only 不发送 API JSON mode，但仍会要求模型输出可解析的描述 JSON。</div></div>
     </div>
   </div>
 </section>
@@ -1045,6 +1060,7 @@ npm install --save-exact "C:\Downloads\koishi-plugin-hds-interlude-0.1.4-beta3.t
     <div class="cmd-block"><button class="copy-btn">复制</button><pre>cd C:\hds-bot
 npm run start</pre></div>
     <p class="muted">日志里出现 SnowLuma 连接成功、adapter-onebot 与 hds-interlude 加载成功即大功告成。</p>
+    <div class="notice info">💡 beta7 的自动推进会先由“时间导演”生成当前时间窗口内的事件账本，再交给主叙事渲染。新项目无需额外配置；如果你从旧版本升级且曾出现自动剧情写到未来，安装后可用管理员私聊执行 <code>interlude.timeline.rebase</code> 重建短期时间状态。</div>
   </div>
 
   <div class="card">
@@ -1053,12 +1069,12 @@ npm run start</pre></div>
     <div class="cmd-block"><button class="copy-btn">复制</button><pre>interlude.doctor
 interlude.story.start</pre></div>
     <p><code>doctor</code> 会检查模型、白名单、时区是否就绪；<code>story.start</code> 会创建第一份主剧本。之后正常发一句话，角色就会回你了——她可能秒回、可能隔一会儿才回，也可能正在忙。</p>
-    <div class="notice info">💡 想随时查看角色状态：发 <code>interlude.status</code>；手动推进一步生活：<code>interlude.advance</code>。完整指令表见 HDSI 文档 command.md。</div>
+    <div class="notice info">💡 想随时查看角色状态：发 <code>interlude.status</code>；手动推进一步生活：<code>interlude.advance</code>；查看近期日程：<code>interlude.schedule</code>。完整指令表见 HDSI 文档 command.md。</div>
   </div>
 
   <div class="card">
     <h3>备选：一键部署脚本</h3>
-    <p class="muted">把下面脚本保存为 <code>setup.ps1</code>（或直接下载），并把 <code>koishi-plugin-hds-interlude-0.1.4-beta3.tgz</code> 放到同一文件夹；在<strong>完成第 1、2、3 步之后</strong>运行。脚本会自动完成创建 Koishi 项目、安装插件、写入配置。</p>
+    <p class="muted">把下面脚本保存为 <code>setup.ps1</code>（或直接下载），并把 <code>koishi-plugin-hds-interlude-0.1.4.tgz</code> 放到同一文件夹；在<strong>完成第 1、2、3 步之后</strong>运行。脚本会自动完成创建 Koishi 项目、安装插件、写入配置。</p>
     <div class="cmd-block"><button class="copy-btn" id="copyPsBtn">复制脚本</button><pre class="yaml-preview" id="psScript"></pre></div>
     <p><button class="btn primary" id="downloadPsBtn">⬇ 下载 setup.ps1</button></p>
     <p class="muted">运行方式：在脚本所在目录打开 PowerShell，执行 <code>powershell -ExecutionPolicy Bypass -File .\setup.ps1</code>，按提示输入安装目录和项目文件夹名即可。</p>
@@ -1120,6 +1136,8 @@ interlude.story.start</pre></div>
       model: '',
       endpoint: '',
       reasoning: 'high',
+      deepseekThinking: 'disabled',
+      deepseekReasoning: 'low',
       region: 'beijing',
       temperature: '0.75',
       topP: '0.88',
@@ -1132,7 +1150,8 @@ interlude.story.start</pre></div>
       useCompaction: !!isFirst,
       useAlter: !!isFirst,
       useEmbedding: false,
-      useStickers: false
+      useStickers: false,
+      useVision: false
     };
   }
 
@@ -1141,6 +1160,8 @@ interlude.story.start</pre></div>
     wsToken: '',
     botQQ: '',
     vision: false,
+    visionMode: 'native',
+    visionDetail: 'auto',
     charName: '',
     charProfile: '18岁的女孩，刚刚高考结束，正准备开始大学生活。平时喜欢熬夜，有点内向，容易胆怯，但心态平和；生活比较丰富，喜欢尝试一些能力范围内没试过的东西，对想干的事情非常有行动力。线上聊天话很少、发言简洁、有点喜欢吐槽，打字不习惯加标点。',
     world: '现实社会，主角平常生活在中国',
@@ -1155,10 +1176,12 @@ interlude.story.start</pre></div>
     typing: '8',
     autoMin: '40',
     mainResponseFormat: 'json-object',
+    mainStreamingMode: 'off',
     quoteReply: true,
     messageReactions: true,
     nativeFaces: true,
-    stickers: false
+    stickers: false,
+    stickerFormat: 'json-object'
   };
 
   function loadData() {
@@ -1188,7 +1211,7 @@ interlude.story.start</pre></div>
             region: parsed.region || 'beijing',
             responseFormat: 'json-object',
             useMain: true, useCompaction: true, useAlter: true,
-            useEmbedding: false, useStickers: false
+            useEmbedding: false, useStickers: false, useVision: false
           }];
         }
       }
@@ -1256,6 +1279,10 @@ interlude.story.start</pre></div>
         if (mode === 'zhipu-official') {
           lines.push(p + '    reasoningEffort: ' + y(pv.reasoning || 'high'));
         }
+        if (mode === 'deepseek-official') {
+          lines.push(p + '    deepseekThinking: ' + y(pv.deepseekThinking === 'enabled' ? 'enabled' : 'disabled'));
+          if (pv.deepseekThinking === 'enabled') lines.push(p + '    deepseekReasoningEffort: ' + y(pv.deepseekReasoning || 'low'));
+        }
         if (mode === 'dashscope-official') {
           lines.push(p + '    dashscopeRegion: ' + y(pv.region || 'beijing'));
         }
@@ -1266,6 +1293,7 @@ interlude.story.start</pre></div>
       lines.push(p + '    useForAlter: ' + (pv.useAlter ? 'true' : 'false'));
       lines.push(p + '    useForEmbedding: ' + (pv.useEmbedding ? 'true' : 'false'));
       lines.push(p + '    useForStickers: ' + (pv.useStickers ? 'true' : 'false'));
+      lines.push(p + '    useForVision: ' + (pv.useVision ? 'true' : 'false'));
     });
     return lines.join('\n');
   }
@@ -1275,6 +1303,7 @@ interlude.story.start</pre></div>
     var L = [p + 'model:'];
     L.push(providerYaml(p + '  '));
     L.push(p + '  mainResponseFormat: ' + y(data.mainResponseFormat === 'prompt-only' ? 'prompt-only' : 'json-object'));
+    L.push(p + '  mainStreamingMode: ' + y(data.mainStreamingMode === 'experimental' ? 'experimental' : 'off'));
     L.push(p + '  failover:');
     L.push(p + '    enabled: true');
     L.push(p + '    strategy: "priority"');
@@ -1283,6 +1312,8 @@ interlude.story.start</pre></div>
     if (data.vision) {
       L.push(p + '  vision:');
       L.push(p + '    enabled: true');
+      L.push(p + '    mode: ' + y(data.visionMode === 'sidecar' ? 'sidecar' : 'native'));
+      L.push(p + '    detail: ' + y(['low', 'high', 'auto'].indexOf(data.visionDetail) >= 0 ? data.visionDetail : 'auto'));
     }
     // 勾选了 Embedding 用途才开启；否则保持默认关闭
     if (data.providers.some(function (pv) { return pv.useEmbedding; })) {
@@ -1343,8 +1374,11 @@ interlude.story.start</pre></div>
     L.push(p + '        relationship: ' + y(data.userRelationship || '该用户与主角不经常联系'));
     L.push(p + '  runtime:');
     L.push(p + '    autoCreate: true');
+    L.push(p + '    contextEntryLimit: 50');
+    L.push(p + '    contextTimeWindowMinutes: 60');
     L.push(p + '    userMessageDebounceSeconds: ' + (parseFloat(data.debounce) || 0));
     L.push(p + '    typingCharactersPerSecond: ' + (parseInt(data.typing, 10) || 8));
+    L.push(p + '    typingJitterRatio: 0.3');
     L.push(p + '    splitReplyMessages: true');
     L.push(p + '    autoAdvanceEnabled: true');
     L.push(p + '    autoAdvanceIntervalMinutes: ' + (parseFloat(data.autoMin) || 40));
@@ -1356,6 +1390,11 @@ interlude.story.start</pre></div>
     L.push(p + '        enabled: true');
     L.push(p + '        minIntervalMinutes: 120');
     L.push(p + '        maxIntervalMinutes: 240');
+    L.push(p + '  schedulePreplan:');
+    L.push(p + '    enabled: true');
+    L.push(p + '    horizonDays: 14');
+    L.push(p + '    reviewAfterLocalHour: 3');
+    L.push(p + '    anchorAutoAdvance: true');
     // 聊天互动（引用回复 / 贴表情 / 原生小表情）
     var anyChat = data.quoteReply || data.messageReactions || data.nativeFaces;
     L.push(p + '  chatActions:');
@@ -1380,6 +1419,7 @@ interlude.story.start</pre></div>
     if (data.stickers && data.providers.some(function (pv) { return pv.useStickers; })) {
       L.push(p + '  stickers:');
       L.push(p + '    enabled: true');
+      L.push(p + '    descriptionResponseFormat: ' + y(data.stickerFormat === 'prompt-only' ? 'prompt-only' : 'json-object'));
     }
     L.push(p + '  logging:');
     L.push(p + '    level: "info"');
@@ -1389,7 +1429,7 @@ interlude.story.start</pre></div>
 
   function fullYaml() {
     return [
-      '# Koishi 配置文件 —— 由 HDS Interlude 0.1.4-beta3-enhanced 部署向导生成',
+      '# Koishi 配置文件 —— 由 HDS Interlude 0.1.4 部署向导生成',
       '# 放置位置：Koishi 项目根目录（与 package.json 同级），覆盖前请备份原文件',
       '# ⚠ 内含 API Key 与 Token，请勿分享或上传到公开仓库',
       '',
@@ -1442,18 +1482,18 @@ interlude.story.start</pre></div>
       return line.replace(/'/g, "''");
     }).join('\n');
     return [
-      '# HDS Interlude 0.1.4-beta3-enhanced 一键部署脚本（由部署向导生成）',
+      '# HDS Interlude 0.1.4 一键部署脚本（由部署向导生成）',
       '# 使用前提：已安装 Node.js；SnowLuma 已启动并注入 QQ 进程',
       '# 运行：powershell -ExecutionPolicy Bypass -File .\\setup.ps1',
       '',
       '$ErrorActionPreference = "Stop"',
       '',
       '# HDSI beta 安装包：默认与 setup.ps1 放在同一文件夹；缺失时可手动输入完整路径',
-      '$betaPackage = Join-Path $PSScriptRoot "koishi-plugin-hds-interlude-0.1.4-beta3.tgz"',
+      '$betaPackage = Join-Path $PSScriptRoot "koishi-plugin-hds-interlude-0.1.4.tgz"',
       'if (-not (Test-Path -LiteralPath $betaPackage)) {',
-      '  $betaPackage = Read-Host "请输入 koishi-plugin-hds-interlude-0.1.4-beta3.tgz 的完整路径"',
+      '  $betaPackage = Read-Host "请输入 koishi-plugin-hds-interlude-0.1.4.tgz 的完整路径"',
       '}',
-      'if (-not (Test-Path -LiteralPath $betaPackage)) { throw "未找到 HDSI 0.1.4-beta3 安装包，脚本已停止。" }',
+      'if (-not (Test-Path -LiteralPath $betaPackage)) { throw "未找到 HDSI 0.1.4 安装包，脚本已停止。" }',
       '$betaPackage = (Resolve-Path -LiteralPath $betaPackage).Path',
       '',
       '# 1. 检查 Node.js',
@@ -1545,6 +1585,9 @@ interlude.story.start</pre></div>
     if (!hasMain) issues.push('没有任何连接勾选"主叙事"用途；至少需要一条');
     if (data.stickers && !data.providers.some(function (pv) { return pv.useStickers; })) {
       issues.push('已开启本地表情包库，但没有任何模型勾选“表情包”用途');
+    }
+    if (data.vision && data.visionMode === 'sidecar' && !data.providers.some(function (pv) { return pv.useVision; })) {
+      issues.push('已选择 sidecar 图片理解，但没有任何模型勾选“侧端识图”用途');
     }
     data.providers.forEach(function (pv, i) {
       var n = i + 1;
@@ -1655,7 +1698,11 @@ interlude.story.start</pre></div>
     ['f_userLabel', 'userLabel'],
     ['f_userProfile', 'userProfile'],
     ['f_userRelationship', 'userRelationship'],
-    ['f_mainResponseFormat', 'mainResponseFormat']
+    ['f_mainResponseFormat', 'mainResponseFormat'],
+    ['f_mainStreamingMode', 'mainStreamingMode'],
+    ['f_visionMode', 'visionMode'],
+    ['f_visionDetail', 'visionDetail'],
+    ['f_stickerFormat', 'stickerFormat']
   ];
 
   /* 发言节奏滑杆：id / 数据键 / 数值显示元素 / 格式化 */
@@ -1699,10 +1746,10 @@ interlude.story.start</pre></div>
     var card = document.createElement('div');
     card.className = 'provider-card';
 
-    var uses = ['useMain', 'useCompaction', 'useAlter', 'useEmbedding', 'useStickers']
+    var uses = ['useMain', 'useCompaction', 'useAlter', 'useEmbedding', 'useStickers', 'useVision']
       .filter(function (k) { return pv[k]; })
       .map(function (k) {
-        return { useMain: '主叙事', useCompaction: '压缩', useAlter: 'Alter', useEmbedding: 'Embedding', useStickers: '表情包' }[k];
+        return { useMain: '主叙事', useCompaction: '压缩', useAlter: 'Alter', useEmbedding: 'Embedding', useStickers: '表情包', useVision: '侧端识图' }[k];
       });
 
     var html = '' +
@@ -1736,6 +1783,19 @@ interlude.story.start</pre></div>
           '<option value="max"' + (pv.reasoning === 'max' ? ' selected' : '') + '>max（最强）</option>' +
           '</select></div>'
         : '') +
+      (pv.mode === 'deepseek-official'
+        ? '<div><label>思考模式</label><select data-f="deepseekThinking">' +
+          '<option value="disabled"' + (pv.deepseekThinking !== 'enabled' ? ' selected' : '') + '>关闭（推荐 · 更快更稳定）</option>' +
+          '<option value="enabled"' + (pv.deepseekThinking === 'enabled' ? ' selected' : '') + '>开启</option>' +
+          '</select><div class="hint">结构化叙事建议关闭；开启后会增加响应等待</div></div>' +
+          (pv.deepseekThinking === 'enabled'
+            ? '<div><label>思考强度</label><select data-f="deepseekReasoning">' +
+              '<option value="low"' + (pv.deepseekReasoning !== 'high' && pv.deepseekReasoning !== 'max' ? ' selected' : '') + '>low（最快）</option>' +
+              '<option value="high"' + (pv.deepseekReasoning === 'high' ? ' selected' : '') + '>high（平衡）</option>' +
+              '<option value="max"' + (pv.deepseekReasoning === 'max' ? ' selected' : '') + '>max（最强）</option>' +
+              '</select></div>'
+            : '')
+        : '') +
       (pv.mode === 'dashscope-official'
         ? '<div><label>服务地域</label><select data-f="region">' +
           ['beijing', 'singapore', 'us'].map(function (r) {
@@ -1750,6 +1810,7 @@ interlude.story.start</pre></div>
       '  <label><input type="checkbox" data-f="useAlter"' + (pv.useAlter ? ' checked' : '') + '>Alter 分析</label>' +
       '  <label><input type="checkbox" data-f="useEmbedding"' + (pv.useEmbedding ? ' checked' : '') + '>Embedding</label>' +
       '  <label><input type="checkbox" data-f="useStickers"' + (pv.useStickers ? ' checked' : '') + '>表情包</label>' +
+      '  <label><input type="checkbox" data-f="useVision"' + (pv.useVision ? ' checked' : '') + '>侧端识图</label>' +
       '</div>' +
       '<div class="muted" style="font-size:12px; margin-top:8px;">Embedding 需单独一条连接，不能与其它用途同时勾选（向量接口无温度/TopP 参数）</div>' +
       samplingRows(pv);
@@ -1765,7 +1826,7 @@ interlude.story.start</pre></div>
         if (el.type === 'checkbox') {
           // Embedding 独占：与其它用途互斥
           if (key === 'useEmbedding' && pv.useEmbedding) {
-            pv.useMain = false; pv.useCompaction = false; pv.useAlter = false; pv.useStickers = false;
+            pv.useMain = false; pv.useCompaction = false; pv.useAlter = false; pv.useStickers = false; pv.useVision = false;
           } else if (key !== 'useEmbedding' && pv[key]) {
             pv.useEmbedding = false;
           }
@@ -1775,6 +1836,7 @@ interlude.story.start</pre></div>
           pv.model = MODES[pv.mode].model;
           renderProviders(); // 切换平台需要重绘条件字段
         }
+        if (key === 'deepseekThinking') renderProviders();
         if (isText && key === 'label') renderProviders(); // 更新卡片标题徽标
         saveData();
         renderPreviews();
@@ -2025,3 +2087,5 @@ interlude.story.start</pre></div>
 </script>
 </body>
 </html>
+
+

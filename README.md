@@ -6,7 +6,7 @@
 
 HDS Interlude 是一个面向 Koishi 一对一与多参与者场景的持续叙事聊天框架。它让用户消息、角色的沉默、延迟回复、主动联系和自动推进，都成为同一段生活剧本中自然可见的部分，并由一次主叙事写作连贯地决定。
 
-当前版本：`0.1.4-beta3`（测试版）。提供持续生活剧本、结构化投递、群聊意愿、多提供商模型连接与可选聊天动作。
+当前版本：`0.1.4`。提供宿主时间轴、持续生活剧本、结构化投递、Schedule Preplan、群聊意愿、多提供商模型连接与可选聊天动作。
 
 ## 文档导航
 
@@ -17,6 +17,7 @@ HDS Interlude 是一个面向 Koishi 一对一与多参与者场景的持续叙�
 - 当前架构：[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 - Alter System 设计与运行规则：[docs/ALTER_SYSTEM.md](docs/ALTER_SYSTEM.md)
 - Agency Window 设计与运行规则：[docs/AGENCY_WINDOW.md](docs/AGENCY_WINDOW.md)
+- Schedule Preplan 近期日程层：[docs/SCHEDULE_PREPLAN.md](docs/SCHEDULE_PREPLAN.md)
 - 版本记录：[docs/CHANGELOG.md](docs/CHANGELOG.md)
 - 安全与依赖说明：[docs/SECURITY.md](docs/SECURITY.md)
 - 历史分析、失败版本与调试资料：[docs/README.md](docs/README.md)
@@ -109,6 +110,26 @@ flowchart TD
 
 模型输出可使用 `<sep/>` 拆分消息。插件会按下一段文字长度模拟短暂输入时间；用户在等待期间继续发言时，旧分段计划会被取消并重新写作。
 
+`typingJitterRatio` 默认是 `0.3`：同样长度的后续气泡会在理论延迟上下约 30% 随机浮动，减少机械感；填写 `0` 可恢复固定延迟。
+
+### 实验性流式首条回复
+
+`model.mainStreamingMode=experimental` 可让支持 OpenAI Chat Completions SSE 的模型在输出完整私聊 `interaction.reply` 后，先发送这条首泡，再继续接收后面的 `script`。默认关闭；它只在 `mainResponseFormat=json-object` 下生效，群聊仍等待完整结果。
+
+| 支持层级 | 模型/接口 |
+| --- | --- |
+| 已有 SSE 接收路径 | `zhipu-official` 的 GLM 官方模型，例如 GLM-5.3-Flash。开启实验开关后可尝试首条提前投递。 |
+| 实验性通用路径 | OpenAI 官方、DeepSeek 官方、Moonshot、百炼、硅基流动、OpenRouter、Gemini OpenAI 兼容模式，以及任意 `openai-compatible` 服务；前提是端点同时支持 `stream:true`、标准 `choices[].delta.content` 和 JSON 对象输出。 |
+| 不适用 | `prompt-only`、不支持 SSE 的模型/中转站、只返回思维链但没有可见 `delta.content` 的接口。 |
+
+未知中转站请先保持关闭；手动开启后观察日志中的“实验性流式首条回复已提前投递”。一旦首条已发送，若后续 JSON 断流或无效，插件保留已发送内容、记录 `stream-finalization-failed`，且不会自动 failover 重发第二条可见回复；后续只会以无 transport 的短恢复任务补写缺失剧本。
+
+### 主叙事 payload 顺序与前缀缓存
+
+`model.mainPayloadOrder=cache-first` 会把用户 payload 的对话历史与低频记忆层前置、每轮变化字段（当前事件、时钟、状态）后置。对支持自动前缀缓存的服务商（DeepSeek、GLM、Kimi 等），连续对话轮可以命中长长的稳定前缀，输入成本与 prefill 延迟显著下降；payload 末尾附带 `recentExchange` 最近交换块，把最后几条交互重新锚定在生成点旁，维持语境显著性。默认 `legacy` 保持历史顺序。开启后建议先在沙盒观察若干轮回复质量与 `回复模式` 分布，不适配可随时切回。
+
+自动推进不把 cache-first 当作世界时间来源：插件会先复用压缩模型生成当前时间窗口内的事件账本，再让主叙事渲染。`recentExchange` 只含真实收发消息，不复制上一段剧本文字，因此缓存优化不会导致自动 prose 自我复读或越过当前时钟。
+
 ## 自动推进与剧情余波
 
 对话结束后，系统可以按配置在约 10 分钟、20 分钟进行短期后续补写，之后按常规间隔继续生活推进；休息时间段可改用更长间隔。
@@ -121,6 +142,8 @@ flowchart TD
 - 角色自身正在进行的生活、配角和世界状态。
 
 因此，用户说过的重要话、请求的提醒，以及影响角色的事件，都会在后续自动推进中持续留下线索。主模型可在角色具备具体动机时发起主动联系；每次候选动作都携带 `willingness`（意愿值）和原因，插件会在阈值、目标合法性与数量边界内完成投递。
+
+Schedule Preplan 在后台空闲整理时维护近期稳定日程：每天最多复用压缩模型进行一次独立轻量审查，参考既有计划后才补写周规律、阶段或日期例外。`stable / contextual / granular` 变化颗粒度控制如何保留已证实的变化；granular 的少量候选安排先以半透明可用性显示，临近后才揭示，且不会自行成为生活事件。主叙事只读取从当前时刻起未来约 12 小时的计划，不会接收整周日历；计划只约束合理性，真实剧情始终优先。固定日程边界还可成为自动推进锚点，减少随机推进跨过上课、到校或离校等节点。
 
 ## 记忆与设定演化
 
@@ -135,8 +158,11 @@ HDSI 按用途分层组织信息，让每次请求获得恰当的连续性，同
 | Overlay | 角色性格、世界状态、关系等在长期剧情中渐进形成的非破坏性变化。 |
 | Perspective | 主角独立于 Canon 的个体价值观 / 看待世界的方式；其 overlay 只在相关情境中细微影响判断。 |
 | 意图 | 延迟回复、提醒、主动联系或后续处理计划。 |
+| Schedule Preplan | 近期计划中的生活结构；后台保存多日，主叙事只读取未来约半天。 |
 
 较早的场景和 Overlay 会在后台分档压缩：保留因果、承诺、大事件与关系变化，减少重复性叙述。压缩以异步整理的方式运行，与用户回合的主叙事调用保持轻量协作。
+
+近期上下文同时使用条目下限与时间窗口：默认至少保留 50 条，并保护最近 60 分钟的真实收发消息。长期事实检索分别为最近已完成事件和未完成承诺保留位置；承诺兑现后可显式关闭旧 fact，并促使 continuity 提前刷新。Continuity 不再保存容易过期的自由文本未来计划，未来安排由 intent 与 Schedule Preplan 提供。
 
 ### 修改设定时的建议
 
@@ -224,17 +250,17 @@ OneBot 模式采用显式白名单：启用后，绑定的机器人 QQ 账号和
 - 是否参与共享主剧本；
 - 需要时的独立备注。
 
-群聊与私聊分开配置。群聊需要单独列入群白名单并填写群用途、主角在群中的身份和发言模式；符合白名单和调度条件的群聊消息直接进入主叙事模型，不再额外调用快速判断模型。
+群聊与私聊分开配置。群聊需要单独列入群白名单并填写群用途、主角在群中的身份和发言模式；符合白名单和调度条件的群聊消息直接进入主叙事模型，不再额外调用快速判断模型。群聊请求开始后，后续群消息会进入下一批，不会作废已经生成的群回复；私聊仍保留首条消息提交前的新消息替代写作机制。
 
 对 `responseMode=always` 的活跃群，可按群开启纯算法 `willingness`：本地意愿分数会随消息、关键词和引用累积，按半衰期衰减，并在超过阈值后以概率决定是否值得调用主模型。@ 机器人始终可以立即通过，主角成功发言后会消耗意愿。这个层只减少不必要的群聊主模型调用，不参与私聊、Alter 或 Agency。
 
 ## 图片与网页观察
 
-### 原生视觉
+### 图片理解
 
-开启 `vision.enabled` 后，使用 OpenAI-compatible 多模态主模型时，图片会作为 `image_url` 内容块和当前用户文本一起发送给模型。支持 OneBot CQ 图片码、URL、`file`、`cache_url` 与机器人 `get_image` 路径，兼容电脑端 JPG 和常见手机端图片来源。
+开启 `vision.enabled` 后，可在 `vision.mode` 选择两种方式。`native` 适合支持图片输入的主叙事模型：图片作为 `image_url` 内容块和当前用户文本一起发送。`sidecar` 适合纯文本主模型：选择一条勾选 `useForVision` 的视觉连接，插件先生成当前图片的事实观察，再把该观察与用户文字交给主叙事。支持 OneBot CQ 图片码、URL、`file`、`cache_url` 与机器人 `get_image` 路径，兼容电脑端 JPG 和常见手机端图片来源。
 
-动态 GIF、动态 WebP 与 APNG 可在 Puppeteer 可用时抽取代表帧后发送；安全读取条件不足时会跳过该图片。图片二进制保持在剧本、记忆与数据库之外，模型只接收已成功加载的视觉内容。
+动态 GIF、动态 WebP 与 APNG 可在 Puppeteer 可用时抽取代表帧后发送；安全读取条件不足时会跳过该图片。图片二进制与 sidecar 观察都保持在剧本、记忆与数据库之外；侧端识图失败时，插件继续处理当前文字而不猜测图片内容。
 
 ### QQ 语音转写（SnowLuma）
 
@@ -261,13 +287,19 @@ npm install koishi-plugin-hds-interlude@beta
 使用本地预发布包时，可在 Koishi 实例目录执行：
 
 ```bash
-npm install /absolute/path/to/koishi-plugin-hds-interlude-0.1.4-beta3.tgz
+npm install /absolute/path/to/koishi-plugin-hds-interlude-0.1.4.tgz
 ```
 
 Windows 示例：
 
 ```powershell
-npm install C:\dev\HDS-Interlude\plugins\hds-interlude\release\koishi-plugin-hds-interlude-0.1.4-beta3.tgz
+npm install C:\dev\HDS-Interlude\plugins\hds-interlude\release\koishi-plugin-hds-interlude-0.1.4.tgz
+```
+
+Koishi Desktop 的实例使用 Yarn 4。请在实例目录执行以下命令，并在完成后重载插件或重启 Desktop：
+
+```powershell
+corepack yarn add "koishi-plugin-hds-interlude@file:C:/dev/HDS-Interlude/plugins/hds-interlude/release/koishi-plugin-hds-interlude-0.1.4.tgz" --exact
 ```
 
 安装后重新加载 Koishi，再在 Console 启用插件。
@@ -290,15 +322,16 @@ OneBot / NapCat 未启动时可能出现 `ECONNREFUSED`，表示适配器正在�
 
 1. **失明模式**：首次配置保持关闭；稳定运行后可开启以获得无命令、极少 HDSI 日志的沉浸式对话。
 2. **基础设定**：主角、世界、配角、叙事风格、默认关系。
-3. **模型中心**：先确认图片理解开关；每个模型连接只填一次地址、密钥和模型名，再勾选它承担主叙事、压缩、Alter 或 Embedding 的用途；下方分别调整各任务的采样与输出。
+3. **模型中心**：先确认图片理解方式；每个模型连接只填一次地址、密钥和模型名，再勾选它承担主叙事、压缩、Alter、Embedding、表情包描述或侧端识图的用途；下方分别调整各任务的采样与输出。
 
 使用 GLM‑5.3‑Flash 时，可在对应模型连接行选择 `mode=zhipu-official`：仅填写智谱 API Key、模型名与推理强度，插件会使用官方 endpoint 和流式请求策略；同一配置内的其它模型行仍可使用普通 OpenAI-compatible 模式。
 4. **平台控制**：启用 OneBot 后填写机器人 QQ、私聊用户白名单；如需群聊，再添加群白名单。
 5. **剧情节奏**：连续消息合并、自动推进、休息时段、延迟消息和主动联系意愿阈值。
-6. **Agency Window**：日程负荷、隐私、设备和主动联系重查边界。
-7. **记忆与上下文**：场景预算、压缩阈值、长期事实、Embedding 与 Overlay 整理策略。
-8. **Alter System**：先使用默认动态阈值和权重；需要时单独选择低成本分析模型。
-9. **可选能力**：视觉、Puppeteer、网页观察、日志级别和日志内容开关。
+6. **Schedule Preplan**：近期日程覆盖天数、每日空闲审查时间和自动推进锚点。
+7. **Agency Window**：日程负荷、隐私、设备和主动联系重查边界。
+8. **记忆与上下文**：场景预算、压缩阈值、长期事实、Embedding 与 Overlay 整理策略。
+9. **Alter System**：先使用默认动态阈值和权重；需要时单独选择低成本分析模型。
+10. **可选能力**：视觉、Puppeteer、网页观察、日志级别和日志内容开关。
 
 所有字段的解释、默认值和调整建议见 [配置说明](CONFIGURATION_GUIDE.md)。首次测试可直接跟随 [新手引导](BEGINNER_GUIDE.md)。
 
@@ -309,8 +342,10 @@ OneBot / NapCat 未启动时可能出现 `ECONNREFUSED`，表示适配器正在�
 | 指令 | 作用 |
 | --- | --- |
 | `interlude.status` | 查看当前故事、调度、模型与运行状态。 |
-| `interlude.context` | 查看本轮主模型会读取的上下文摘要。 |
-| `interlude.timeline [limit]` | 查看近期时间线。 |
+| `interlude.context` | 查看运行上下文摘要：场景、关系、Overlay 与长期事实。 |
+| `interlude.schedule` | 查看 Schedule Preplan 和未来约半天的计划。 |
+| `interlude.schedule.refresh` | 重新审查日程，保留旧计划作稳定参考。 |
+| `interlude.timeline [limit]` | 查看当前账号可见的近期时间线。 |
 | `interlude.script [limit]` | 查看近期剧本条目。 |
 | `interlude.advance` | 手动推进一次剧本。 |
 | `interlude.memory [limit]` | 查看记忆摘要。 |

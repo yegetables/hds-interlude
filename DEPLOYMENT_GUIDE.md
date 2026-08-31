@@ -45,7 +45,7 @@ Koishi 第一次启动会准备运行环境，耐心等待即可。
 
 ```powershell
 cd C:\Users\你的用户名\AppData\Roaming\Koishi\Desktop\data\instances\default
-npm install --save-exact C:\路径\koishi-plugin-hds-interlude-0.1.4-beta3.tgz
+npm install --save-exact C:\路径\koishi-plugin-hds-interlude-0.1.4.tgz
 ```
 
 安装完成后回到 Koishi Console，添加或启用 `hds-interlude`。
@@ -97,11 +97,15 @@ http://127.0.0.1:6099/webui/
 - Endpoint；
 - API Key；
 - 实际模型名；
-- 主叙事 / 压缩 / Alter / Embedding 用途开关。
+- 主叙事 / 压缩 / Alter / Embedding / 表情包描述用途开关。
 
 例如，一个只负责主叙事的模型就只勾选“用作主叙事模型”。一个低成本模型可以只勾选“用作后台压缩模型”。Embedding 模型必须确实支持 `/embeddings`，不要把普通聊天模型误勾为 Embedding。
 
-常用官方模式还包括 `openai-official`、`deepseek-official`、`moonshot-official`、`dashscope-official`、`siliconflow-official`、`openrouter` 与 `gemini-openai`。每一种在提供商行选中后都会固定其官方 endpoint，只显示 API Key、模型名和必要的地域选项；它们可以和智谱、普通中转站行同时存在。
+常用官方模式还包括 `openai-official`、`deepseek-official`、`moonshot-official`、`dashscope-official`、`siliconflow-official`、`openrouter` 与 `gemini-openai`。每一种在提供商行选中后都会固定其官方 endpoint；DeepSeek 额外提供思考开关与强度，百炼会显示地域选项。它们可以和智谱、普通中转站行同时存在。
+
+### DeepSeek 官方提供商
+
+选择 `deepseek-official` 并保存重载后，填写 API Key 和模型名。默认关闭思考模式，适合需要快速、稳定结构化输出的主叙事、压缩和 Alter；开启后可选择 `low`、`high` 或 `max` 推理强度。遇到空回复、字段缺失或反复恢复重写时，先关闭思考，或把主叙事输出格式改为 `prompt-only` 后再测试。
 
 ### 智谱官方 GLM 提供商
 
@@ -111,7 +115,9 @@ http://127.0.0.1:6099/webui/
 - 模型名，例如 `glm-5.3-flash`；
 - 推理强度：`low`、`high` 或 `max`。
 
-智谱官方 endpoint 会自动填写，不能与同一行的普通 endpoint 混用。GLM‑5.3‑Flash 会走 SSE 流式接收：首个可见文本最长等待 45 秒，收到首字后不设置总等待上限。它仍在完整 JSON 解析成功后才向 QQ 投递，保证剧本与消息记录一致。
+智谱官方 endpoint 会自动填写，不能与同一行的普通 endpoint 混用。GLM‑5.3‑Flash 会走 SSE 流式接收：首个可见文本最长等待 45 秒，收到首字后不设置总等待上限。默认仍在完整 JSON 解析成功后才向 QQ 投递，保证剧本与消息记录一致。
+
+如需试验更快的私聊首泡，在确认模型支持 JSON 对象和 SSE 后，将 `model.mainStreamingMode` 改为 `experimental`。它会先等待完整的 `interaction.reply` 字段，再发送首条消息并继续接收剧本；群聊不使用提前投递。首条已发而流式收尾失败时，只会补写剧本，不会重发第二条消息。未知中转站先保持 `off`，避免流式协议不兼容。
 
 视觉模型才开启 `model.vision.enabled`。普通文本模型保持关闭；使用 GLM‑5.3‑Flash 时可在确认官方模式可用后再测试图片。
 
@@ -127,6 +133,8 @@ http://127.0.0.1:6099/webui/
 - 关闭 `model.vision.enabled`、Embedding 与主动消息；
 - `mainResponseFormat` 选择 `json-object`；
 - 先确认一次普通私聊能正常完成。
+
+Schedule Preplan 默认开启并复用压缩模型，不需要再配置一条模型连接。它会在后台空闲时维护未来 14 天的计划结构，但主叙事只读取未来约 12 小时。第一次后台整理完成后，可发送 `interlude.schedule` 检查结果；固定课程或开学日期必须来自角色设定或真实剧本证据。
 
 ## 五、创建角色与 QQ 白名单
 

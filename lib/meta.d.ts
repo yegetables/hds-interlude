@@ -1,1 +1,1 @@
-export declare const HDS_INTERLUDE_VERSION = "0.1.4-beta3";
+export declare const HDS_INTERLUDE_VERSION = "0.1.4";

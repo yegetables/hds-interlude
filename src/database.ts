@@ -1,7 +1,7 @@
 import { Context } from 'koishi'
 import {
   InterludeArc, InterludeParticipant, InterludeScene, InterludeStory, NarrativeFact, NarrativeIntent,
-  NarrativeMemory, OverlaySnapshot, ScriptEntry, StatePatchProposal, StickerAsset, WebObservation,
+  NarrativeMemory, OverlaySnapshot, SchedulePreplanRecord, ScriptEntry, StatePatchProposal, StickerAsset, WebObservation,
 } from './types'
 
 declare module 'koishi' {
@@ -18,12 +18,13 @@ declare module 'koishi' {
     interlude_overlay_snapshot: OverlaySnapshot
     interlude_sticker: StickerAsset
     interlude_web_observation: WebObservation
+    interlude_schedule_preplan: SchedulePreplanRecord
   }
 }
 
 export function registerTables(ctx: Context) {
   // Koishi keeps the model registry on the parent context during plugin
-  // reloads. Re-registering the same eight schemas forces minato to rebuild
+  // reloads. Re-registering the same schemas forces minato to rebuild
   // indexes and is a noticeable source of reload latency.
   const existingTables = (ctx.model as any).tables ?? {}
   // Existing installations already have the original tables registered by a
@@ -33,6 +34,7 @@ export function registerTables(ctx: Context) {
     if (!existingTables.interlude_web_observation) registerWebObservationTable(ctx)
     if (!existingTables.interlude_overlay_snapshot) registerOverlaySnapshotTable(ctx)
     if (!existingTables.interlude_sticker) registerStickerTable(ctx)
+    if (!existingTables.interlude_schedule_preplan) registerSchedulePreplanTable(ctx)
     return
   }
 
@@ -101,6 +103,7 @@ export function registerTables(ctx: Context) {
   registerWebObservationTable(ctx)
   registerOverlaySnapshotTable(ctx)
   registerStickerTable(ctx)
+  registerSchedulePreplanTable(ctx)
 }
 
 /** Kept separately so an upgrade can register only this new table without
@@ -130,6 +133,17 @@ function registerStickerTable(ctx: Context) {
   ctx.model.extend('interlude_sticker', {
     id: 'unsigned', assetId: 'string(255)', filePath: 'string(1024)', group: 'string(128)', mimeType: 'string(127)',
     animated: 'boolean', size: 'unsigned', hash: 'string(64)', description: 'text', aliases: 'json', status: 'string(16)',
+    embedding: 'json',
     createdAt: 'timestamp', updatedAt: 'timestamp',
   }, { primary: 'id', autoInc: true, unique: ['assetId'], indexes: ['status', 'group', 'updatedAt'] })
+}
+
+function registerSchedulePreplanTable(ctx: Context) {
+  if ((ctx.model as any).tables?.interlude_schedule_preplan) return
+  ctx.model.extend('interlude_schedule_preplan', {
+    storyId: 'string(255)', revision: 'unsigned', timezone: 'string(127)',
+    validFrom: 'string(10)', validThrough: 'string(10)', lastReviewedLocalDate: 'string(10)',
+    lastEvidenceEntryId: 'unsigned', reviewReason: 'text', regimes: 'json', exceptions: 'json', materializedDays: 'json',
+    createdAt: 'timestamp', updatedAt: 'timestamp',
+  }, { primary: 'storyId', indexes: ['validThrough', 'lastReviewedLocalDate'] })
 }

@@ -1,6 +1,6 @@
-# HDS Interlude 管理员指令
+# HDS Interlude 管理与查看指令
 
-适用版本：`0.1.3`
+适用版本：`0.1.4`
 ## 使用前先看这里
 
 - 新手安装和首次测试：`BEGINNER_GUIDE.md`
@@ -9,7 +9,7 @@
 
 
 
-本文档说明 HDS Interlude 当前提供的 Koishi 指令。指令默认只在私聊中使用，并且会经过 OneBot/NapCat 白名单检查。
+本文档说明 HDS Interlude 当前提供的 Koishi 指令。建议在私聊执行；授权群聊中的 `interlude.*` 同样会交给 Koishi 命令解析器。所有命令都会经过 HDSI 的授权检查，写入、调度与清理类操作还需要管理员权限。
 
 `blindMode.enabled=true` 时，本页全部指令以及当前 Koishi 实例的其它已解析指令都会被静默屏蔽；请在 Console 关闭失明模式并重载插件后再使用管理功能。
 
@@ -53,6 +53,7 @@ sharedStory:
 | `interlude.pause` | 管理员 | 暂停自动推进、延迟处理和主动处理 |
 | `interlude.resume` | 管理员 | 恢复自动处理 |
 | `interlude.advance` | 管理员 | 立即将剧本补写到当前真实时间 |
+| `interlude.timeline.rebase` | 管理员 | 从当前真实时间重建自动推进时间线，保留历史剧本 |
 | `interlude.timeline [条数]` | 白名单用户 | 查看最近原始剧本条目 |
 | `interlude.memory [条数]` | 白名单用户 | 查看长期事实记忆 |
 | `interlude.context` | 白名单用户 | 查看活动场景、关系态势、剧本引子和长期连续性 |
@@ -69,6 +70,9 @@ sharedStory:
 | `interlude.overlay.clear <部分>` | 管理员 | 询问 y/n 后，只清理 character、perspective、relationship、world 或 all 对应的设定 overlay |
 | `interlude.overlay.status` | 管理员 | 查看当前 overlay、待积累提案和压缩归档数量 |
 | `interlude.overlay.compact` | 管理员 | 只合并和压缩已应用的 overlay，不整理普通剧本记忆 |
+| `interlude.schedule` | 已授权用户 | 查看 Schedule Preplan 覆盖范围和未来约半天的日程 |
+| `interlude.schedule.refresh` | 管理员 | 重新审查当前日程，保留旧计划作为稳定参考 |
+| `interlude.schedule.rebuild` | 管理员 | `schedule.refresh` 的兼容别名 |
 | `interlude.database.clear` | 管理员 | 询问 y/n 后清空 HDSI 自有 SQLite 表；不会删除 Koishi 或其它插件数据 |
 | `interlude.purge.all` | 管理员 | 询问 y/n 后彻底重置所有平台的剧本、记忆与 Canon，只保留一部空白主剧本 |
 | `interlude.purge.platform <平台>` | 管理员 | 询问 y/n 后清空并归档指定平台的所有故事，例如 sandbox 或 onebot |
@@ -104,7 +108,7 @@ interlude.story.start
 - 参与者数量
 - 故事状态（`active` / `paused`）
 - 剧本游标 `cursorAt`
-- 当前模型模式
+- 当前主模型连接
 - 是否允许主动可见消息
 
 ### `interlude.setup <JSON>`
@@ -155,9 +159,19 @@ interlude.advance
 
 该指令可能调用一次主叙事模型，并可能投递模型判断为“当前已经发生”的可见消息。它不会预写未来事件。
 
+### `interlude.timeline.rebase`
+
+从旧测试版升级后，如此前已把未来事件写入活跃场景、连续性快照或 workingDetails，可由管理员执行一次：
+
+```text
+interlude.timeline.rebase
+```
+
+它会询问确认，然后以当前真实时间重置这些短期时间状态；历史剧本、Canon、参与者和长期事实保持不变。
+
 ### `interlude.timeline [条数]`
 
-查看最近原始剧本条目，默认 10 条，最多显示 30 条。
+查看当前账号可见的近期剧本条目，默认 10 条，最多显示 30 条。时间会按 Bot/故事配置的时区显示，并显式附带 `GMT±X` 偏移。
 
 ```text
 interlude.timeline 20
@@ -167,7 +181,7 @@ interlude.timeline 20
 
 ### `interlude.memory [条数]`
 
-查看主模型或压缩模型提取的长期事实，默认 10 条，最多 30 条。
+查看当前账号相关的记忆摘要，默认 10 条，最多 30 条。它适合快速确认当前关系分支会读取到哪些记忆；若要审计事实库的原始编号，请使用管理员指令 `interlude.memory.facts`。
 
 ```text
 interlude.memory 15
@@ -177,7 +191,7 @@ interlude.memory 15
 
 ### `interlude.context`
 
-查看当前上下文摘要，包括：
+查看运行上下文摘要，包括：
 
 - 当前活动场景的引子和压缩摘要
 - 当前剧情弧线的标题与摘要
@@ -192,7 +206,7 @@ interlude.context
 
 ### `interlude.compact`
 
-立即执行一次完整的后台记忆整理。
+立即执行一次完整的后台记忆整理；如果 Schedule Preplan 到期，也会一并进行独立的轻量日程审查。
 
 ```text
 interlude.compact
@@ -320,7 +334,23 @@ interlude.overlay.status
 interlude.overlay.compact
 ```
 
-该操作会将较早的已应用状态变化合并为 overlay 快照，并重建当前仍需送入主模型的 live overlay。它不会删除原始状态提案，也不会清理待积累候选。
+### `interlude.schedule`
+
+查看 Schedule Preplan 的版本、覆盖日期、最后审查原因，以及从当前时刻起未来约 12 小时的计划块。输出是计划结构，不代表事项已经实际发生。
+
+```text
+interlude.schedule
+```
+
+### `interlude.schedule.refresh`
+
+将现有 Schedule Preplan 标记为重新审查。旧计划会保留作稳定参考；命令不会阻塞聊天，当前前台回合结束且达到每日审查时间后，后台会复用压缩模型进行独立轻量审查。
+
+```text
+interlude.schedule.refresh
+```
+
+`interlude.schedule.rebuild` 保留为兼容别名，效果与 `refresh` 相同。
 
 ## 删除剧本和记忆
 

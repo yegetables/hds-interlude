@@ -7,8 +7,8 @@ import { HDS_INTERLUDE_VERSION } from '../src/meta'
 
 test('Console sections follow the documented setup order', () => {
   assert.deepEqual(Object.keys(Config.dict), [
-    'blindMode', 'storyDefaults', 'model', 'onebot', 'chatActions', 'stickers', 'sharedStory', 'runtime',
-    'agency', 'memory', 'alterSystem', 'browser', 'logging',
+    'blindMode', 'storyDefaults', 'model', 'onebot', 'runtime', 'schedulePreplan', 'sharedStory', 'chatActions',
+    'stickers', 'agency', 'memory', 'alterSystem', 'browser', 'logging',
   ])
 })
 
@@ -27,6 +27,7 @@ test('local sticker library is opt-in and requires an explicitly assigned visual
   assert.equal(stickers.enabled.meta.default, false)
   assert.equal(stickers.directory.meta.default, 'data/hds-interlude/stickers')
   assert.equal(stickers.catalogLimit.meta.default, 40)
+  assert.equal(stickers.descriptionResponseFormat.meta.default, 'json-object')
 })
 
 test('Blind Mode is the first Console section and defaults to a minimal ten-minute heartbeat', () => {
@@ -46,7 +47,7 @@ test('ignored compatibility switches stay out of the active Console', () => {
 
 test('runtime and plugin exports share one version constant', () => {
   assert.equal(version, HDS_INTERLUDE_VERSION)
-  assert.equal(version, '0.1.4-beta3')
+  assert.equal(version, '0.1.4')
 })
 
 test('layered colored logs are the Console default and remain optional', () => {
@@ -65,6 +66,10 @@ test('model Console centralizes connections and task assignment without exposing
   assert.equal('models' in model, false)
   assert.equal('mainModelId' in model, false)
   assert.equal(model.mainResponseFormat.meta.default, 'json-object')
+  assert.equal(model.mainStreamingMode.meta.default, 'off')
+  assert.equal(model.vision.dict.mode.meta.default, 'native')
+  assert.equal(model.vision.dict.detail.meta.default, 'auto')
+  assert.equal(configuredProviders({ providers: [{ label: 'Vision', enabled: true, endpoint: 'https://example.test', model: 'vision', useForVision: true }] } as any)[0].useForVision, true)
 })
 
 test('Zhipu official provider mode supplies its fixed endpoint and stream-capable task roles', () => {
@@ -101,6 +106,15 @@ test('official provider presets resolve independent Chat Completions endpoints',
   ])
 })
 
+test('DeepSeek official provider exposes independent thinking controls', () => {
+  const [provider] = configuredProviders({ mode: 'openai-compatible', providers: [{
+    label: 'DeepSeek', enabled: true, mode: 'deepseek-official', apiKey: 'x', model: 'deepseek-chat', useForMain: true,
+  }] } as any)
+  assert.equal(provider.deepseekOfficial, true)
+  assert.equal(provider.deepseekThinking, 'disabled')
+  assert.equal(provider.deepseekReasoningEffort, 'low')
+})
+
 test('Agency Window exposes only the four bounded scheduling controls', () => {
   const agency = Config.dict.agency.dict
   assert.deepEqual(Object.keys(agency), [
@@ -108,6 +122,16 @@ test('Agency Window exposes only the four bounded scheduling controls', () => {
   ])
   assert.equal(agency.enabled.meta.default, true)
   assert.equal(agency.maxWindowMinutes.meta.default, 240)
+})
+
+test('Schedule Preplan is lightweight, enabled by default and reuses the compaction provider', () => {
+  const schedule = Config.dict.schedulePreplan.dict
+  assert.deepEqual(Object.keys(schedule), ['enabled', 'horizonDays', 'variationLevel', 'candidateActivationProbability', 'candidateRevealMinutes', 'reviewAfterLocalHour', 'anchorAutoAdvance'])
+  assert.equal(schedule.enabled.meta.default, true)
+  assert.equal(schedule.horizonDays.meta.default, 14)
+  assert.equal(schedule.variationLevel.meta.default, 'stable')
+  assert.equal('modelId' in schedule, false)
+  assert.equal('providerId' in schedule, false)
 })
 
 test('real model turns require non-empty narrative prose before they can succeed', () => {
@@ -120,6 +144,12 @@ test('memory compaction defaults leave a slightly wider short-conversation buffe
   const memory = Config.dict.memory.dict
   assert.equal(memory.sceneEntryThreshold.meta.default, 16)
   assert.equal(memory.sceneCharacterThreshold.meta.default, 10_000)
+})
+
+test('recent context combines a fifty-entry floor with a one-hour raw-message window', () => {
+  const runtime = Config.dict.runtime.dict
+  assert.equal(runtime.contextEntryLimit.meta.default, 50)
+  assert.equal(runtime.contextTimeWindowMinutes.meta.default, 60)
 })
 
 test('Console exposes a separate, optional protagonist perspective layer', () => {

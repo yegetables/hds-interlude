@@ -4,6 +4,8 @@ import { BlindModeConfig, BrowserConfig, ChatActionsConfig, Config as InterludeC
 import { AgencyConfig, AlterSystemConfig, ChatReactionName, NativeFaceSemantic, StorySetting } from './types'
 import { HDS_INTERLUDE_VERSION } from './meta'
 import { GroupWillingnessConfig } from './group-willingness'
+import { resolveSchedulePreplanConfig, SchedulePreplanConfig, schedulePreplanWindow } from './schedule-preplan'
+import { formatLogTime, formatStoryDisplayTime } from './time'
 
 declare module 'koishi' { interface Context { interlude: InterludeService } }
 
@@ -30,21 +32,31 @@ const defaultProvider: ProviderConfig = {
   useForAlter: true,
   useForEmbedding: false,
   useForStickers: false,
+  useForVision: false,
   mode: 'openai-compatible',
 }
 
-const ProviderCommon = Schema.object({
-  label: Schema.string().default('Primary model').description('模型连接的显示名称，例如 GLM 4.7 Flash。'),
-  enabled: Schema.boolean().default(true).description('是否启用这条模型连接。'),
-  mode: Schema.union(['openai-compatible', 'zhipu-official', 'openai-official', 'deepseek-official', 'moonshot-official', 'dashscope-official', 'siliconflow-official', 'openrouter', 'gemini-openai']).default('openai-compatible').description('请求协议。保存并重载后显示对应字段。'),
-  useForMain: Schema.boolean().default(true).description('主叙事用途；每类用途建议一条。'),
-  useForCompaction: Schema.boolean().default(true).description('后台压缩用途。'),
-  useForAlter: Schema.boolean().default(true).description('Alter 分析用途。'),
-  useForEmbedding: Schema.boolean().default(false).description('Embedding 用途；模型需支持 /embeddings。'),
-  useForStickers: Schema.boolean().default(false).description('表情包描述用途；必须选择能够识图的模型。'),
+/** Keep the card in the order users actually configure it: identity →
+ * connection details (provided by the selected mode) → task assignment. */
+const ProviderIdentity = Schema.object({
+  label: Schema.string().default('Primary model').description('连接名称。'),
+  enabled: Schema.boolean().default(true).description('启用此连接。'),
+  mode: Schema.union(['openai-compatible', 'zhipu-official', 'openai-official', 'deepseek-official', 'moonshot-official', 'dashscope-official', 'siliconflow-official', 'openrouter', 'gemini-openai']).default('openai-compatible').description('接口预设；重载后显示对应字段。'),
 })
 
-function OfficialProvider(mode: 'openai-official' | 'deepseek-official' | 'moonshot-official' | 'siliconflow-official' | 'openrouter' | 'gemini-openai', defaultModel: string, description: string): Schema<any> {
+const ProviderAssignments = Schema.object({
+  useForMain: Schema.boolean().default(true).description('用于主叙事。'),
+  useForCompaction: Schema.boolean().default(true).description('用于后台压缩。'),
+  useForAlter: Schema.boolean().default(true).description('用于 Alter 分析。'),
+  useForEmbedding: Schema.boolean().default(false).description('用于 Embedding。'),
+  useForStickers: Schema.boolean().default(false).description('用于表情包描述。'),
+  useForVision: Schema.boolean().default(false).description('用于侧端识图。'),
+  priceInput: Schema.number().min(0).default(0).description('输入单价（百万 tokens；0 不计费）。'),
+  priceOutput: Schema.number().min(0).default(0).description('输出单价（百万 tokens；0 不计费）。'),
+  priceCachedInput: Schema.number().min(0).default(0).description('缓存输入单价（百万 tokens；0 按输入计）。'),
+})
+
+function OfficialProvider(mode: 'openai-official' | 'moonshot-official' | 'siliconflow-official' | 'openrouter' | 'gemini-openai', defaultModel: string, description: string): Schema<any> {
   return Schema.object({
     mode: Schema.const(mode),
     apiKey: Schema.string().role('secret').default('').description(`${description} API Key。官方 endpoint 自动使用。`),
@@ -53,15 +65,15 @@ function OfficialProvider(mode: 'openai-official' | 'deepseek-official' | 'moons
 }
 
 const Provider: Schema<ProviderConfig> = Schema.intersect([
-  ProviderCommon,
+  ProviderIdentity,
   Schema.union([
     Schema.object({
       mode: Schema.const('openai-compatible'),
-      endpoint: Schema.string().default('').description('OpenAI 兼容 Chat Completions 完整地址，例如 /v1/chat/completions。'),
-      apiKey: Schema.string().role('secret').default('').description('鉴权密钥；仅保存在 Koishi 配置中。'),
-      model: Schema.string().default('').description('服务商实际模型名，例如 gpt-4o-mini。'),
-      extraHeaders: Schema.string().role('textarea').default('').description('额外 HTTP 请求头，必须是 JSON 对象；无特殊需求留空。'),
-      extraBody: Schema.string().role('textarea').default('').description('额外请求体字段，必须是 JSON 对象；无特殊需求留空。'),
+      endpoint: Schema.string().default('').description('Chat Completions 完整地址。'),
+      apiKey: Schema.string().role('secret').default('').description('API Key。'),
+      model: Schema.string().default('').description('模型名。'),
+      extraHeaders: Schema.string().role('textarea').default('').description('额外请求头 JSON（可留空）。'),
+      extraBody: Schema.string().role('textarea').default('').description('额外请求体 JSON（可留空）。'),
     }),
     Schema.object({
       mode: Schema.const('zhipu-official'),
@@ -70,7 +82,13 @@ const Provider: Schema<ProviderConfig> = Schema.intersect([
       reasoningEffort: Schema.union(['low', 'high', 'max']).default('high').description('GLM-5.3-Flash 推理强度；high 是平衡默认值。'),
     }),
     OfficialProvider('openai-official', 'gpt-5-mini', 'OpenAI 官方'),
-    OfficialProvider('deepseek-official', 'deepseek-chat', 'DeepSeek 官方'),
+    Schema.object({
+      mode: Schema.const('deepseek-official'),
+      apiKey: Schema.string().role('secret').default('').description('DeepSeek 官方 API Key。官方 endpoint 自动使用。'),
+      model: Schema.string().default('deepseek-chat').description('DeepSeek 模型代码，例如 deepseek-chat 或 deepseek-reasoner。'),
+      deepseekThinking: Schema.union(['disabled', 'enabled']).default('disabled').description('DeepSeek 思考模式。关闭时响应更快，适合结构化叙事；开启后可选择推理强度。'),
+      deepseekReasoningEffort: Schema.union(['low', 'high', 'max']).default('low').description('仅在 DeepSeek 思考模式开启时生效。'),
+    }),
     OfficialProvider('moonshot-official', 'kimi-k2.5', 'Kimi / Moonshot 官方'),
     Schema.object({
       mode: Schema.const('dashscope-official'),
@@ -82,14 +100,15 @@ const Provider: Schema<ProviderConfig> = Schema.intersect([
     OfficialProvider('openrouter', 'openai/gpt-5-mini', 'OpenRouter'),
     OfficialProvider('gemini-openai', 'gemini-2.5-flash', 'Google Gemini OpenAI 兼容'),
   ]),
+  ProviderAssignments,
 ]) as unknown as Schema<ProviderConfig>
 
 const Failover: Schema<FailoverConfig> = Schema.object({
-  enabled: Schema.boolean().default(true).description('主服务商失败时是否尝试其它已启用服务商。'),
+  enabled: Schema.boolean().default(true).description('主连接失败时尝试其它连接。'),
   strategy: Schema.union(['priority', 'round-robin']).default('priority').description('priority 按配置顺序选择；round-robin 轮换选择。'),
-  maxAttemptsPerProvider: Schema.natural().min(1).max(5).default(1).description('单个服务商连续失败前的最大尝试次数。'),
-  cooldownMinutes: Schema.natural().min(0).max(1_440).default(5).description('服务商失败后的冷却时间，单位分钟。'),
-})
+  maxAttemptsPerProvider: Schema.natural().min(1).max(5).default(1).description('单条连接连续失败前的最大尝试次数。'),
+  cooldownMinutes: Schema.natural().min(0).max(1_440).default(5).description('连接失败后的冷却时间，单位分钟。'),
+}).collapse(true)
 
 const Embedding: Schema<EmbeddingConfig> = Schema.object({
   modelId: Schema.string().default('').description('模型预设 ID；填写后优先使用 model.models 中对应的模型。'),
@@ -106,31 +125,38 @@ const Embedding: Schema<EmbeddingConfig> = Schema.object({
 void Embedding
 
 const Vision: Schema<VisionConfig> = Schema.object({
-  enabled: Schema.boolean().default(false).description('原生识图开关。开启后，当前私聊图片会作为多模态输入发送给所选 OpenAI-compatible 主模型；模型本身必须支持视觉输入。图片不会写入剧本数据库。'),
+  enabled: Schema.boolean().default(false).description('启用图片理解。'),
+  mode: Schema.union(['native', 'sidecar']).default('native').description('native 由主模型识图；sidecar 使用独立视觉连接。'),
+  detail: Schema.union(['low', 'high', 'auto']).default('auto').description('图片细节：low / high / auto。'),
+  maxImageDimension: Schema.union([0, 512, 768, 1024]).default(1024).description('图片最长边；0 使用原图。'),
 }).collapse(true)
 
 const Model: Schema<ModelConfig> = Schema.object({
-  vision: Vision.default({ enabled: false }).description('图片理解：开启后把当前私聊图片送入主叙事模型。请只为明确支持视觉输入的模型开启。'),
-  providers: Schema.array(Provider.collapse(true)).default([defaultProvider]).description('模型中心：每一行一次性填写连接、密钥、模型名和用途分配。无需填写或记忆任何 ID。'),
+  vision: Vision.default({ enabled: false, mode: 'native', detail: 'auto', maxImageDimension: 1024 }).description('图片理解设置。'),
+  providers: Schema.array(Provider.collapse(true)).default([defaultProvider]).description('新增连接后填写 Key、模型名，再勾选用途。'),
   mainTemperature: Schema.number().min(0).max(2).default(0.8).description('主叙事采样温度。'),
-  mainTopP: Schema.number().min(0).max(1).default(1).description('主叙事 top-p；通常保持 1，仅调整 temperature。'),
+  mainTopP: Schema.number().min(0).max(1).default(1).description('主叙事 top-p。'),
   mainMaxTokens: Schema.natural().min(0).max(100_000).default(4096).description('主叙事最大输出 token 数。'),
   mainTimeout: Schema.natural().min(1_000).max(300_000).default(60_000).role('ms').description('主叙事请求超时，单位毫秒。'),
-  mainResponseFormat: Schema.union(['json-object', 'prompt-only']).default('json-object').description('主叙事唯一的输出格式设置。支持 JSON mode 时选 json-object；不支持时改为 prompt-only。'),
-  failover: Failover.default({ enabled: true, strategy: 'priority', maxAttemptsPerProvider: 1, cooldownMinutes: 5 }).description('主模型请求失败时的切换策略。'),
+  mainResponseFormat: Schema.union(['json-object', 'prompt-only']).default('json-object').description('主叙事输出格式；不支持 JSON mode 时选 prompt-only。'),
+  mainStreamingMode: Schema.union(['off', 'experimental']).default('off').description('实验性私聊首泡加速；仅 JSON 模式。'),
+  mainPayloadOrder: Schema.union(['legacy', 'cache-first']).default('legacy').description('请求字段顺序；支持前缀缓存的接口可选 cache-first。'),
+  failover: Failover.default({ enabled: true, strategy: 'priority', maxAttemptsPerProvider: 1, cooldownMinutes: 5 }).description('主叙事请求失败时的切换策略。'),
   mainPrompt: Schema.string().role('textarea').default('Continue the character-centered life script with grounded actions, motives, relationships, and ordinary time passing.').description('主叙事行为指令：定义模型如何连续写作、推进生活并处理外部事件。'),
-  formatPrompt: Schema.string().role('textarea').default('').description('结构化输出补充说明；只能扩展固定协议，不能覆盖 JSON、时间和安全校验。'),
-  fixedPrompt: Schema.string().role('textarea').default('').description('所有故事通用的长期约束。'),
+  formatPrompt: Schema.string().role('textarea').default('').description('结构化输出补充规则。'),
+  fixedPrompt: Schema.string().role('textarea').default('').description('通用长期规则。'),
   stylePrompt: Schema.string().role('textarea').default('Use restrained, realistic prose with concrete daily details, natural pauses, and no forced drama.').description('全局叙事文风；故事级 style 可进一步覆盖。'),
   embedding: (Schema.object({
     enabled: Schema.boolean().default(false).description('启用长期事实的语义检索。模型由上方“用作 Embedding 模型”用途开关选择。'),
-    liveQuery: Schema.boolean().default(false).description('是否在每次实时对话中额外请求 Embedding 做语义检索。'),
+    liveQuery: Schema.boolean().default(false).description('是否在每次实时对话中额外请求 Embedding 做语义检索。关闭可减少一次网络请求、降低回复延迟；后台向量补齐不受影响。'),
     endpoint: Schema.string().default('').description('Embedding 完整地址；留空时从所选模型连接的 Chat 地址推导。'),
     dimensions: Schema.natural().min(0).max(32_768).default(0).description('向量维度；0 表示由服务商决定。'),
     timeout: Schema.natural().min(500).max(120_000).default(10_000).role('ms').description('Embedding 请求超时，单位毫秒。'),
     maxInputCharacters: Schema.natural().min(100).max(32_000).default(4_000).description('单条事实送入 Embedding 的最大字符数。'),
     backfillBatchSize: Schema.natural().min(0).max(100).default(5).description('每轮后台补齐旧事实的数量。'),
-  }) as unknown as Schema<EmbeddingConfig>).default({ enabled: false, modelId: '', providerId: '', endpoint: '', model: '', dimensions: 0, timeout: 10_000, maxInputCharacters: 4_000, backfillBatchSize: 5 }).description('长期事实的语义召回设置。'),
+    semanticStickerFilter: Schema.boolean().default(true).description('启用贴纸目录语义过滤：按当前消息的向量相似度只注入最相关的 12 条贴纸描述，降低每轮 token 开销。需要一条勾选“用作 Embedding 模型”的连接；不可用或素材尚未建立向量时自动回退全量目录。'),
+    semanticHistory: Schema.boolean().default(false).description('启用历史语义召回：将剧本条目向量化（后台逐步覆盖全表，最新优先），每轮按当前消息检索最相关的 3 条旧片段注入“回忆块”。开启后每次实时对话多一次向量请求；建议同时勾选“用作 Embedding 模型”。'),
+  }) as unknown as Schema<EmbeddingConfig>).default({ enabled: false, modelId: '', providerId: '', endpoint: '', model: '', dimensions: 0, timeout: 10_000, maxInputCharacters: 4_000, backfillBatchSize: 5, semanticStickerFilter: true }).description('高级：长期事实的语义召回设置。通常只需开启功能并在模型连接中勾选 Embedding 用途。').collapse(true),
   compaction: (Schema.object({
     enabled: Schema.boolean().default(true).description('启用后台剧本压缩与长期事实提取。'),
     temperature: Schema.number().min(0).max(2).default(0.3).description('压缩采样温度；建议保持较低以提高稳定性。'),
@@ -141,7 +167,7 @@ const Model: Schema<ModelConfig> = Schema.object({
     mainPrompt: Schema.string().role('textarea').default('Compress completed scenes into concise continuity notes while preserving causality, promises, unresolved matters, and gradual character change.').description('压缩任务指令：定义摘要、事实和状态变更的提取目标。'),
     fixedPrompt: Schema.string().role('textarea').default('').description('压缩器必须遵守的长期规则。'),
     stylePrompt: Schema.string().role('textarea').default('Concise, factual, chronological, and concrete.').description('压缩结果的表达风格。'),
-  }) as unknown as Schema<CompactionConfig>).default({ enabled: true, modelId: '', providerId: '', model: '', temperature: 0.3, topP: 1, maxTokens: 2048, timeout: 60_000, responseFormat: 'json-object', mainPrompt: 'Compress completed scenes into concise continuity notes while preserving causality, promises, unresolved matters, and gradual character change.', fixedPrompt: '', stylePrompt: 'Concise, factual, chronological, and concrete.' }),
+  }) as unknown as Schema<CompactionConfig>).default({ enabled: true, modelId: '', providerId: '', model: '', temperature: 0.3, topP: 1, maxTokens: 2048, timeout: 60_000, responseFormat: 'json-object', mainPrompt: 'Compress completed scenes into concise continuity notes while preserving causality, promises, unresolved matters, and gradual character change.', fixedPrompt: '', stylePrompt: 'Concise, factual, chronological, and concrete.' }).description('高级：后台压缩与 Preplan 共用设置；一般保持默认即可。').collapse(true),
 })
 
 const RestWindowSchema: Schema<RestWindow> = Schema.object({
@@ -154,29 +180,31 @@ const RestWindowSchema: Schema<RestWindow> = Schema.object({
 })
 
 const Runtime: Schema<RuntimeConfig> = Schema.object({
-  splitReplyMessages: Schema.boolean().default(true).description('是否将主模型回复中的 <sep/> 拆成多条 QQ 消息。'),
+  splitReplyMessages: Schema.boolean().default(true).description('是否将主叙事回复中的 <sep/> 拆成多条 QQ 消息。'),
   messageSeparator: Schema.string().default('<sep/>').description('分段消息标记。通常保持 <sep/>；模型会在需要多条气泡时输出它。'),
   typingBaseDelaySeconds: Schema.number().min(0).max(60).default(1).description('发送第二条及后续分段消息前的基础打字等待秒数。'),
   typingCharactersPerSecond: Schema.number().min(1).max(100).default(8).description('模拟打字速度，每秒字符数；数值越小，长消息等待越久。'),
   typingMaxDelaySeconds: Schema.number().min(0).max(120).default(12).description('单条后续分段消息的最长打字等待秒数。'),
-  userMessageDebounceSeconds: Schema.number().min(0).max(15).default(2).description('短消息合并等待：每次收到私聊后，等待这段时间再请求主模型；期间的新消息会合并进同一次写作。设为 0 可关闭。'),
+  typingJitterRatio: Schema.number().min(0).max(0.5).step(0.05).default(0.3).description('打字延迟随机浮动；0 为固定延迟。'),
+  userMessageDebounceSeconds: Schema.number().min(0).max(15).default(2).description('短消息合并等待秒数；0 关闭。'),
   narrativeRetryDelaySeconds: Schema.natural().min(5).max(3_600).default(60).description('叙事模型请求失败后，自动再次尝试处理该用户回合前等待的秒数。'),
   narrativeRetryMaxAttempts: Schema.natural().min(0).max(50).default(6).description('单次用户回合因模型失败可自动重试的最多次数；0 表示关闭。'),
   captureDirectMessages: Schema.boolean().default(true).description('是否拦截并处理私聊文本消息。'),
-  autoCreate: Schema.boolean().default(false).description('无主剧本时是否从当前 Console 档案自动启动；关闭后先用 interlude.doctor 检查，再执行 interlude.story.start。'),
+  autoCreate: Schema.boolean().default(false).description('首次私聊时自动从 Console 档案创建故事。'),
   ignoreCommandMessages: Schema.boolean().default(true).description('是否跳过 interlude.* 管理命令，避免进入剧本。'),
   allowProactiveMessages: Schema.boolean().default(false).description('是否允许无新消息时向参与者主动发送可见消息。'),
-  proactiveWillingnessThreshold: Schema.number().min(0).max(1).step(0.05).default(0.65).description('主动联系意愿门槛。自动推进时由主模型为每次联系给出 0~1 的意愿值，低于此值不发送；没有固定冷却。'),
+  proactiveWillingnessThreshold: Schema.number().min(0).max(1).step(0.05).default(0.65).description('主动联系意愿门槛。'),
   sweepIntervalMinutes: Schema.natural().min(1).max(1_440).default(5).description('后台扫描周期；仅用于发现到期任务，不代表每轮都调用模型。'),
   minimumAdvanceMinutes: Schema.natural().min(1).max(10_080).default(30).description('手动“interlude.advance”的最小有效补写间隔；到期计划和对话后的短期补写不受此限制。'),
   maxStoriesPerSweep: Schema.natural().min(1).max(1_000).default(20).description('单轮后台扫描最多处理的主剧本数量。'),
-  contextEntryLimit: Schema.natural().min(1).max(200).default(30).description('主模型读取的最近剧本条目数；越大越耗 token。'),
-  memoryLimit: Schema.natural().min(1).max(200).default(20).description('主模型读取的长期事实数量；会经过相关性重排。'),
+  contextEntryLimit: Schema.natural().min(1).max(200).default(50).description('近期原始记录的最低保留条目数。'),
+  contextTimeWindowMinutes: Schema.natural().min(0).max(1_440).default(60).description('额外保留最近多少分钟的记录；0 关闭。'),
+  memoryLimit: Schema.natural().min(1).max(200).default(20).description('主叙事读取的长期事实数量；会经过相关性重排。'),
   maxScriptCharacters: Schema.natural().min(500).max(12_000).default(8_000).description('单次写作允许追加的剧本文本上限。'),
   maxMessageCharacters: Schema.natural().min(1).max(12_000).default(2_000).description('单条可见消息的最大字符数。'),
   minimumDelayedReplySeconds: Schema.natural().min(0).max(86_400).default(10).description('模型允许设置的最短延迟，单位秒。'),
   maximumDelayedReplyMinutes: Schema.natural().min(1).max(43_200).default(1_440).description('模型允许设置的最长延迟，单位分钟。'),
-  cancelDelayedRepliesOnUserMessage: Schema.boolean().default(true).description('新消息到达时取消普通延迟回复和跨关系计划；未发送的 <sep/> 分段无论此开关如何都会被截断并进入替代写作上下文。'),
+  cancelDelayedRepliesOnUserMessage: Schema.boolean().default(true).description('新消息到达时取消普通延迟回复。'),
   autoAdvanceEnabled: Schema.boolean().default(true).description('无对话时是否按真实时间补写角色生活。'),
   autoAdvanceIntervalMinutes: Schema.natural().min(5).max(1_440).default(40).description('普通时段自动推进的目标间隔，单位分钟。'),
   autoAdvanceJitterMinutes: Schema.natural().min(0).max(60).default(5).description('自动推进间隔的随机浮动范围，单位分钟。'),
@@ -188,16 +216,26 @@ const Runtime: Schema<RuntimeConfig> = Schema.object({
 })
 
 const BlindMode: Schema<BlindModeConfig> = Schema.object({
-  enabled: Schema.boolean().default(false).description('沉浸运行：静默命令与 HDSI 日志，仅保留健康心跳。稳定后开启；关闭并重载即可恢复管理。'),
+  enabled: Schema.boolean().default(false).description('启用沉浸运行：静默命令与 HDSI 日志，仅保留健康心跳。稳定后开启；关闭并重载即可恢复管理。'),
   healthReportMinutes: Schema.natural().min(1).max(1_440).default(10).description('健康心跳间隔，单位分钟。'),
 }).description('0. 失明模式：沉浸式运行、命令静默与最小健康心跳。')
+
+const SchedulePreplan: Schema<SchedulePreplanConfig> = Schema.object({
+  enabled: Schema.boolean().default(true).description('启用近期日程审查与投影。'),
+  horizonDays: Schema.natural().min(3).max(30).default(14).description('日程保存和展开天数。'),
+  variationLevel: Schema.union(['stable', 'contextual', 'granular']).default('stable').description('变化颗粒度：稳定规律、阶段例外或少量候选变化。'),
+  candidateActivationProbability: Schema.number().min(0.05).max(0.5).step(0.05).default(0.25).description('候选变化激活概率。'),
+  candidateRevealMinutes: Schema.natural().min(15).max(360).default(120).description('候选具体内容的提前揭示时间。'),
+  reviewAfterLocalHour: Schema.natural().min(0).max(23).default(3).description('每天从主角本地时间几点起允许进行一次空闲审查；没有新证据且覆盖充足时不调用模型。'),
+  anchorAutoAdvance: Schema.boolean().default(true).description('让固定日程的开始/结束成为自动推进候选锚点，减少随机推进跨过上课、到校或离校等关键节点。'),
+})
 
 const Agency: Schema<AgencyConfig> = Schema.object({
   enabled: Schema.boolean().default(true).description('启用主体行动窗口。它只判断日程、隐私、设备和生活来源的联系理由，不读取或复用 Alter 情绪值。'),
   maxWindowMinutes: Schema.natural().min(5).max(1_440).default(240).description('一张 Agency Window 最长有效时间；过期后必须由新的生活回合重新判断。'),
   minimumProactiveIntervalMinutes: Schema.natural().min(0).max(10_080).default(60).description('同一参与者两次普通主动联系之间的安全间隔；承诺型联系可以绕过。'),
   maxCandidateHours: Schema.natural().min(1).max(168).default(24).description('生活产生的主动联系候选最长保留时间；过期后自然放下。'),
-})
+}).collapse(true)
 
 const AlterSystem: Schema<AlterSystemConfig> = Schema.object({
   enabled: Schema.boolean().default(true).description('启用情绪偏移追踪。它只增加临时氛围参考，不替代 recentScript、continuity 或稳定设定。'),
@@ -212,7 +250,7 @@ const AlterSystem: Schema<AlterSystemConfig> = Schema.object({
   maxTokens: Schema.natural().min(64).max(2_000).default(400).description('侧端分析最大输出 token；只需要一到两句话。'),
   timeout: Schema.natural().min(1_000).max(120_000).default(30_000).role('ms').description('侧端分析超时。失败时保留累计值，稍后重试。'),
   prompt: Schema.string().role('textarea').default('').description('侧端分析的附加要求；不能覆盖固定的 JSON、隐私和非指令化约束。'),
-})
+}).collapse(true)
 
 const Browser: Schema<BrowserConfig> = Schema.object({
   enabled: Schema.boolean().default(false).description('启用 Puppeteer 只读网页观察。还需要在 Koishi 安装并启用 puppeteer 插件；未启用时聊天功能不受影响。'),
@@ -230,17 +268,17 @@ const Browser: Schema<BrowserConfig> = Schema.object({
   maxExcerptCharacters: Schema.natural().min(200).max(12_000).default(3_000).description('单条网页观察送给主模型的最大字符数。'),
   maxObservationsInPrompt: Schema.natural().min(1).max(20).default(4).description('单次主叙事请求附带的最近网页观察数量。'),
   cacheMinutes: Schema.natural().min(0).max(10_080).default(30).description('相同搜索或 URL 在此时间内复用已有观察，减少重复浏览；0 表示每次重新读取。'),
-  allowGroupTriggeredResearch: Schema.boolean().default(false).description('允许群聊主叙事产生浏览意图。默认关闭，避免群成员内容触发角色浏览。'),
+  allowGroupTriggeredResearch: Schema.boolean().default(false).description('启用群聊浏览意图。默认关闭，避免群成员内容触发角色浏览。'),
   logObservationPreview: Schema.boolean().default(false).description('在日志中显示网页观察的标题和节选；网页内容可能包含隐私或不可信文本，生产环境建议关闭。'),
-})
+}).collapse(true)
 
 const Memory: Schema<MemoryConfig> = Schema.object({
   enabled: Schema.boolean().default(true).description('启用场景压缩、长期事实和状态演化。'),
   backgroundIntervalMinutes: Schema.natural().min(1).max(1_440).default(10).description('后台记忆整理检查周期，单位分钟。'),
   sceneEntryThreshold: Schema.natural().min(1).max(500).default(16).description('未压缩剧本条目达到此数量时触发整理。默认 16 条，减少短对话中的频繁后台调用。'),
   sceneCharacterThreshold: Schema.natural().min(500).max(200_000).default(10_000).description('未压缩剧本字符数达到此值时触发整理。默认 10000 字，长场景会优先保持连续性。'),
-  recentEntryLimit: Schema.natural().min(1).max(200).default(30).description('每次主模型请求附带的最近原始条目数。'),
-  factLimit: Schema.natural().min(1).max(200).default(20).description('每次主模型请求附带的长期事实数。'),
+  recentEntryLimit: Schema.natural().min(1).max(200).default(30).description('每次主叙事请求附带的最近原始条目数。'),
+  factLimit: Schema.natural().min(1).max(200).default(20).description('每次主叙事请求附带的长期事实数。'),
   statePatchConfidenceThreshold: Schema.number().min(0).max(1).default(0.82).description('普通设定变更的最低置信度；低于此值只保留为候选。'),
   majorStatePatchConfidenceThreshold: Schema.number().min(0).max(1).default(0.95).description('重大设定变更的最低置信度。'),
   statePatchMinEvidence: Schema.natural().min(1).max(20).default(3).description('兼容旧配置；普通变化至少需要的证据回合数下限。运行时不会低于 3。'),
@@ -254,6 +292,7 @@ const Memory: Schema<MemoryConfig> = Schema.object({
   sceneHookCharacters: Schema.natural().min(100).max(10_000).default(2_000).description('场景引子的最大字符数。'),
   sceneSummaryCharacters: Schema.natural().min(500).max(50_000).default(8_000).description('场景摘要的最大字符数。'),
   arcSummaryCharacters: Schema.natural().min(500).max(100_000).default(12_000).description('剧情弧线摘要的最大字符数。'),
+  previousSceneSummaries: Schema.natural().min(0).max(4).default(2).description('随主提示词附带几个紧邻已关闭场景的摘要（每条裁剪至 2000 字符，带时间范围），填补原始窗口与弧线摘要之间的记忆缝隙。0 表示关闭。'),
   factContentCharacters: Schema.natural().min(100).max(20_000).default(4_000).description('单条长期事实的最大字符数。'),
   factImportanceWeight: Schema.number().min(0).max(1).default(0.5).description('事实排序中的重要度权重。'),
   factConfidenceWeight: Schema.number().min(0).max(1).default(0.35).description('事实排序中的置信度权重。'),
@@ -263,7 +302,7 @@ const Memory: Schema<MemoryConfig> = Schema.object({
   autoApplyStatePatches: Schema.boolean().default(true).description('是否自动应用达到门槛的设定演化建议。'),
   allowMajorStateChanges: Schema.boolean().default(true).description('是否允许自动应用重大人物或世界状态变更。'),
   activeConsequencesEnabled: Schema.boolean().default(true).description('启用“剧情余波”：让确实影响后续生活的谈话或事件，在之后的写作中持续发挥短期作用。关闭后不会新增或注入余波。'),
-  activeConsequencePromptLimit: Schema.natural().min(1).max(20).default(6).description('单次主模型写作最多携带几条仍在生效的剧情余波。数值越高，连续性更强，但会增加少量上下文。'),
+  activeConsequencePromptLimit: Schema.natural().min(1).max(20).default(6).description('单次主叙事写作最多携带几条仍在生效的剧情余波。数值越高，连续性更强，但会增加少量上下文。'),
   activeConsequenceMaxDays: Schema.natural().min(1).max(30).default(7).description('一条剧情余波最长保留多少天。到期后会自然淡出；它不用于永久修改角色设定。'),
   activeConsequenceDefaultStrength: Schema.number().min(0).max(1).step(0.05).default(0.55).description('剧情余波未写明强度时的默认影响程度。0 表示极轻微，1 表示会明显影响主角近期生活。'),
   overlayCompressionEnabled: Schema.boolean().default(true).description('将较久以前、已应用的人设和关系变化压缩为分层摘要；不会改变 Canon 或删除原始补丁。'),
@@ -273,32 +312,32 @@ const Memory: Schema<MemoryConfig> = Schema.object({
   overlayMonthlyWindowDays: Schema.natural().min(5).max(30).default(10).description('长期 overlay 状态的合并窗口。默认每 10 天合并一次。'),
   overlayWeeklySummaryCharacters: Schema.natural().min(300).max(8_000).default(1_600).description('单个七天 overlay 摘要的最大字符数。'),
   overlayMonthlySummaryCharacters: Schema.natural().min(300).max(12_000).default(2_400).description('单个长期 overlay 摘要的最大字符数。'),
-})
+}).collapse(true)
 
 const StoryDefaults: Schema<StoryDefaults> = Schema.object({
   characterName: Schema.string().default('Unnamed character').description('主角显示名称。'),
-  characterProfile: Schema.string().role('textarea').default('').description('主角的背景、性格、日程和说话方式；作为故事起点，不是永久锁定的人设。若这里发生大幅修改，请保存后执行 interlude.overlay.clear character，随后按提示输入 y 确认；小幅补充、措辞调整或细节修正无需其它操作。'),
-  perspective: Schema.string().role('textarea').default('').description('主角个体价值观 / 看待世界的方式：独立于 Canon 的外壳人格层，描述她面对人和事件时稳定的理解习惯。仅在相关情境中自然影响判断；可由 perspective overlay 随长期剧情演化。新故事创建时写入。'),
-  userProfile: Schema.string().role('textarea').default('').description('未单独配置参与者时使用的默认用户资料；可被白名单行覆盖。'),
-  relationship: Schema.string().role('textarea').default('').description('未单独配置参与者时使用的初始关系；可被白名单行覆盖。大幅改变关系定位时执行 interlude.overlay.clear relationship，随后按提示输入 y 确认；小幅调整无需处理。'),
-  world: Schema.string().role('textarea').default('').description('故事时代、地点和现实规则；作为剧本的初始世界状态。若大幅改写世界前提，请执行 interlude.overlay.clear world，随后按提示输入 y 确认；小幅补充无需处理。'),
+  characterProfile: Schema.string().role('textarea').default('').description('主角背景、性格、日程与说话方式。'),
+  perspective: Schema.string().role('textarea').default('').description('主角稳定的价值观和看待世界方式。'),
+  userProfile: Schema.string().role('textarea').default('').description('默认用户资料；可由白名单行覆盖。'),
+  relationship: Schema.string().role('textarea').default('').description('默认初始关系；可由白名单行覆盖。'),
+  world: Schema.string().role('textarea').default('').description('故事时代、地点与现实规则。'),
   supportingCast: Schema.string().role('textarea').default('').description('配角及其与主角的关系；无配角可留空。'),
   location: Schema.string().default('').description('主角的主要活动地点。'),
-  style: Schema.string().role('textarea').default('现实主义日常叙事，情绪克制，关系变化缓慢而具体。').description('该主剧本的文风；优先级高于全局 stylePrompt。'),
+  style: Schema.string().role('textarea').default('现实主义日常叙事，情绪克制，关系变化缓慢而具体。').description('故事级叙事文风。'),
   timezone: Schema.string().default('Asia/Shanghai').description('用于自动推进、休息窗口和延迟时间解析的 IANA 时区。'),
 })
 
 const Logging: Schema<LoggingConfig> = Schema.object({
-  level: Schema.union(['silent', 'error', 'warn', 'info', 'debug']).default('info').description('错误级别阈值。日常运行建议保持 info；排查异常时临时使用 debug。'),
+  level: Schema.union(['silent', 'error', 'warn', 'info', 'debug']).default('info').description('日志级别。'),
   verbosity: Schema.union(['summary', 'standard', 'diagnostic']).default('standard').description('运行信息密度：摘要只显示关键结果；标准显示模型、计时器和后台任务；诊断追加跳过原因、队列和上下文统计。'),
   format: Schema.union(['layered', 'compact', 'detailed']).default('layered').description('显示布局：layered 为彩色任务时间线；compact 为单行；detailed 为兼容旧版的分行格式。'),
   colors: Schema.boolean().default(true).description('为阶段、完成、警告、错误、记忆和 Alter 添加 ANSI 语义颜色；Koishi Console 与常规终端均可渲染。'),
-  colorTheme: Schema.union(['dark', 'light']).default('dark').description('layered 的高对比配色：dark 适合深色 Console；light 使用更深颜色，适合白色或明亮背景。服务端无法自动判断 Console 主题，请按界面手动选择。'),
-  kaomoji: Schema.boolean().default(true).description('使用固定颜文字标识接收、处理、完成、投递等动作；关闭后改用简洁符号。'),
+  colorTheme: Schema.union(['dark', 'light']).default('dark').description('深色或浅色 Console 配色。'),
+  kaomoji: Schema.boolean().default(true).description('使用颜文字标识运行阶段。'),
   logScriptPreview: Schema.boolean().default(false).description('是否输出本轮剧本内容；可能包含私聊信息，生产环境建议关闭。'),
   logMessageContent: Schema.boolean().default(false).description('是否输出用户消息和主角可见消息内容；涉及隐私，生产环境建议关闭。'),
   previewLength: Schema.natural().min(50).max(4_000).default(500).description('剧本和消息内容写入日志时的最大字符数。'),
-})
+}).collapse(true)
 
 const OneBotBotAccount: Schema<OneBotAccountRule> = Schema.object({
   qq: Schema.string().default('').description('机器人 QQ 号；为空表示不限制发送账号。'),
@@ -344,40 +383,41 @@ const GroupChatRuleSchema: Schema<GroupChatRule> = (Schema.object({
 }) as unknown as Schema<GroupChatRule>).collapse(true)
 
 const VoiceTranscription: Schema<import('./service').VoiceTranscriptionConfig> = Schema.object({
-  enabled: Schema.boolean().default(false).description('SnowLuma 私聊语音转写，默认关闭。'),
+  enabled: Schema.boolean().default(false).description('启用 SnowLuma 私聊语音转写。默认关闭。'),
   timeoutMs: Schema.natural().min(1_000).max(60_000).default(20_000).role('ms').description('单条语音转写等待上限。'),
 }).collapse(true)
 
 const OneBot: Schema<OneBotNapCatConfig> = Schema.object({
   enabled: Schema.boolean().default(true).description('启用 OneBot/NapCat 账号过滤。'),
-  botAccounts: Schema.array(OneBotBotAccount).role('table').default([]).description('允许处理和投递角色消息的机器人账号。启用过滤时，空表拒绝所有机器人账号。'),
-  userAccounts: Schema.array(OneBotUserAccount).default([]).description('用户白名单及关系初始化表；纵向卡片便于填写人物资料和关系文本。空表拒绝所有私聊用户。'),
-  groupChats: Schema.array(GroupChatRuleSchema).default([]).description('群聊白名单。每个群以可折叠卡片显示，适合填写群用途和角色定位。群成员无需重复加入私聊用户白名单。'),
+  botAccounts: Schema.array(OneBotBotAccount).role('table').default([]).description('机器人账号白名单；空表拒绝全部账号。'),
+  userAccounts: Schema.array(OneBotUserAccount).default([]).description('用户白名单与初始关系；空表拒绝全部私聊。'),
+  groupChats: Schema.array(GroupChatRuleSchema).default([]).description('群聊白名单与角色定位。'),
   ignoreSelfMessages: Schema.boolean().default(true).description('忽略机器人自身产生的消息事件。'),
   voiceTranscription: VoiceTranscription.default({ enabled: false, timeoutMs: 20_000 }).description('SnowLuma 语音转写：仅处理当前私聊 record 语音，并以文本形式进入现有剧本流程。'),
 })
 
 const ChatActions: Schema<ChatActionsConfig> = Schema.object({
-  enabled: Schema.boolean().default(false).description('启用聊天动作能力层。关闭时不会向主模型增加任何动作字段。'),
-  platforms: Schema.array(Schema.union(['qq', 'wechat'])).role('table').default(['qq']).description('允许使用聊天动作的平台，可同时选择。平台还必须有已注册、在线的能力连接器。'),
+  enabled: Schema.boolean().default(false).description('启用聊天动作。'),
+  platforms: Schema.array(Schema.union(['qq', 'wechat'])).role('table').default(['qq']).description('允许使用动作的平台。'),
   quoteReply: Schema.boolean().default(true).description('允许主角引用当前上下文中的一条消息进行指定回复。'),
-  messageReactions: Schema.boolean().default(true).description('允许主角给当前上下文中的消息贴一个表情回应；当前内置实现为 QQ 群聊。'),
+  messageReactions: Schema.boolean().default(true).description('允许消息表情回应。'),
   allowedReactions: Schema.array(Schema.union(['like', 'smile', 'laugh', 'heart', 'surprised', 'sad', 'angry'])).role('table')
     .default(['like', 'smile', 'laugh', 'heart'] as ChatReactionName[])
     .description('主模型可以选择的语义表情；平台连接器负责转换为实际表情编号。'),
   nativeFaces: Schema.boolean().default(true).description('允许主角在需要时发送 QQ 原生小表情。'),
-  expressionThreshold: Schema.number().min(0).max(1).step(0.05).default(0.7).description('表情与本地表情包的最低表达意愿；低于此值只发送文字。'),
+  expressionThreshold: Schema.number().min(0).max(1).step(0.05).default(0.7).description('表情与本地表情包的最低表达意愿。'),
   allowedNativeFaces: Schema.array(Schema.union(['smile', 'laugh', 'sweat', 'awkward', 'heart', 'surprised', 'sad', 'angry'])).role('table')
     .default(['smile', 'laugh', 'sweat', 'awkward'] as NativeFaceSemantic[])
     .description('允许主模型使用的 QQ 原生表情语义。'),
-})
+}).collapse(true)
 
 const Stickers: Schema<StickerLibraryConfig> = Schema.object({
-  enabled: Schema.boolean().default(false).description('启用本地表情包库。关闭时不扫描目录、不调用视觉模型，也不向主模型提供素材。'),
+  enabled: Schema.boolean().default(false).description('启用本地表情包库。'),
   directory: Schema.path({ allowCreate: true, filters: ['directory'] }).default('data/hds-interlude/stickers').description('本地表情包根目录；一级子文件夹会成为素材分组。'),
   maxFileSizeMB: Schema.natural().min(1).max(30).default(10).description('单个表情包允许扫描的最大体积，单位 MB。'),
   catalogLimit: Schema.natural().min(1).max(80).default(40).description('单次主模型最多读取多少条表情包描述。'),
-})
+  descriptionResponseFormat: Schema.union(['json-object', 'prompt-only']).default('json-object').description('表情包描述输出格式。'),
+}).collapse(true)
 
 const SharedStory: Schema<SharedStoryConfig> = Schema.object({
   autoEnrollParticipants: Schema.boolean().default(true).description('白名单用户首次私聊时是否自动加入主剧本。'),
@@ -386,22 +426,23 @@ const SharedStory: Schema<SharedStoryConfig> = Schema.object({
   maxCrossConversationActions: Schema.natural().min(0).max(5).default(1).description('单次主模型回合最多执行的跨账号投递动作。'),
   participantContextLimit: Schema.natural().min(1).max(20).default(6).description('单次请求附带的其它参与者上下文数量。'),
   managerAccounts: Schema.array(Schema.string()).role('table').default([]).description('可执行管理命令的 QQ；留空表示所有已授权用户。'),
-})
+}).collapse(true)
 
 export const Config: Schema<InterludeConfig> = Schema.object({
   blindMode: BlindMode,
   storyDefaults: StoryDefaults.description('1. 剧本起点：主角、世界、默认关系、地点、时区和叙事风格。'),
-  model: Model.description('2. 模型：服务商、模型预设、主叙事、压缩、Embedding 与视觉输入。'),
-  onebot: OneBot.description('3. OneBot/NapCat：机器人账号、私聊白名单和群聊白名单。'),
-  chatActions: ChatActions.default({ enabled: false, platforms: ['qq'], quoteReply: true, messageReactions: true, allowedReactions: ['like', 'smile', 'laugh', 'heart'], nativeFaces: true, expressionThreshold: 0.7, allowedNativeFaces: ['smile', 'laugh', 'sweat', 'awkward'] }).description('4. 聊天动作：按平台启用指定回复与消息表情；只有已注册能力才进入提示词。'),
-  stickers: Stickers.default({ enabled: false, directory: 'data/hds-interlude/stickers', maxFileSizeMB: 10, catalogLimit: 40 }).description('5. 本地表情包：每五分钟扫描新增素材，并由勾选 useForStickers 的视觉模型生成描述。'),
-  sharedStory: SharedStory.description('6. 共享剧本：参与者加入、跨账号行为和管理员权限。'),
-  runtime: Runtime.description('6. 对话与时间：消息合并、回复投递、失败重试和自动生活推进。'),
-  agency: Agency.description('7. Agency Window：日程压力、隐私、设备可用性和生活来源的主动联系。'),
-  memory: Memory.description('8. 连续性与记忆：场景压缩、事实召回、剧情余波和设定演化。'),
-  alterSystem: AlterSystem.description('9. Alter System：低频氛围偏移、动态阈值、权重和侧端分析模型。'),
-  browser: Browser.description('10. 网页观察：Puppeteer 只读浏览与安全边界。'),
-  logging: Logging.description('11. 日志：级别、信息密度、布局和隐私预览。'),
+  model: Model.description('2. 模型中心：先添加连接并勾选用途；主叙事参数和高级模块保持在同一处。'),
+  onebot: OneBot.description('3. 接入与对象：机器人账号、私聊白名单、群聊与语音。'),
+  runtime: Runtime.description('4. 对话节奏：消息合并、打字、失败重试与自动生活推进。'),
+  schedulePreplan: SchedulePreplan.description('5. Schedule Preplan：近期稳定日程与变化颗粒度；主提示词只读取未来约半天。'),
+  sharedStory: SharedStory.description('6. 高级共享：参与者、跨账号行为和管理员权限。'),
+  chatActions: ChatActions.default({ enabled: false, platforms: ['qq'], quoteReply: true, messageReactions: true, allowedReactions: ['like', 'smile', 'laugh', 'heart'], nativeFaces: true, expressionThreshold: 0.7, allowedNativeFaces: ['smile', 'laugh', 'sweat', 'awkward'] }).description('7. 可选聊天动作：引用回复、贴反应与 QQ 原生表情。'),
+  stickers: Stickers.default({ enabled: false, directory: 'data/hds-interlude/stickers', maxFileSizeMB: 10, catalogLimit: 40 }).description('8. 可选本地表情包：启用后扫描素材，并由视觉模型建立描述。'),
+  agency: Agency.description('9. 高级主动性：日程压力、隐私、设备和生活来源的联系条件。'),
+  memory: Memory.description('10. 高级连续性：场景压缩、事实召回、剧情余波和设定演化。'),
+  alterSystem: AlterSystem.description('11. 高级 Alter：低频氛围偏移、动态阈值、权重和侧端分析。'),
+  browser: Browser.description('12. 可选网页观察：Puppeteer 只读浏览与安全边界。'),
+  logging: Logging.description('13. 高级日志：级别、信息密度、布局和隐私预览。'),
 })
 
 export function apply(ctx: Context, config: InterludeConfig) {
@@ -414,7 +455,7 @@ export function apply(ctx: Context, config: InterludeConfig) {
     // action runs. Returning an empty fragment consumes them silently.
     ctx.on('command/before-execute', () => '')
   } else {
-    registerCommands(ctx, service)
+    registerCommands(ctx, service, config)
   }
 
   ctx.middleware(async (session, next) => {
@@ -434,8 +475,8 @@ export function apply(ctx: Context, config: InterludeConfig) {
   if (!blindModeEnabled) startupLogger.info('plugin load completed')
 }
 
-function registerCommands(ctx: Context, service: InterludeService) {
-  ctx.command('interlude', 'HDS Interlude：私聊故事测试与管理命令')
+function registerCommands(ctx: Context, service: InterludeService, config: InterludeConfig) {
+  ctx.command('interlude', 'HDS Interlude：管理与查看命令')
 
   const startStoryFromConsole = async (session: Session, legacyName?: string) => {
     if (!requireManager(service, session)) return '无权限：手动启动共享主剧本需要 HDSI 管理员权限。'
@@ -486,7 +527,7 @@ function registerCommands(ctx: Context, service: InterludeService) {
       }
     })
 
-  ctx.command('interlude.status', '查看当前故事是否启用、主角、游标和主动消息开关')
+  ctx.command('interlude.status', '查看当前故事、游标、主模型连接与主动消息开关')
     .action(async ({ session }) => {
       const story = await requireStory(service, session)
       if (typeof story === 'string') return story
@@ -495,7 +536,7 @@ function registerCommands(ctx: Context, service: InterludeService) {
         `关系人数：${(await service.participants(story.id)).length}`,
         `故事状态：${story.status}`,
         `已写到：${story.cursorAt.toISOString()}`,
-        `模型模式：${service.config.model.mode}`,
+        `主模型连接：${service.config.model.providers.find(provider => provider.useForMain && provider.enabled !== false)?.label || '未指定（按模型配置回退）'}`,
         `允许主动可见消息：${service.config.runtime.allowProactiveMessages ? '开启' : '关闭'}`,
         `Agency Window：${service.config.agency?.enabled === false ? '关闭' : '开启'}（${story.state.agencyWindow?.activityLoad || '尚未建立'}）`,
       ].join('\n')
@@ -513,11 +554,21 @@ function registerCommands(ctx: Context, service: InterludeService) {
       const story = await requireStory(service, session)
       if (typeof story === 'string') return story
       const messages = await service.advanceStory(story)
-      await service.deliverMessages(story, messages, session)
-      return messages.length ? '剧本已补写到现在，并已发送其中已经发生的可见角色消息。' : '剧本已补写到现在；这次没有发生可见角色消息。'
+      const delivered = await service.deliverMessages(story, messages, session)
+      return delivered.length ? '剧本已补写到现在，并已发送其中已经发生的可见角色消息。' : messages.length ? '剧本已补写到现在；可见消息投递未完成，请查看日志。' : '剧本已补写到现在；这次没有发生可见角色消息。'
     })
 
-  ctx.command('interlude.timeline [limit:number]', '查看最近剧本记录；limit 为条数，默认 10')
+  ctx.command('interlude.timeline.rebase', '管理员：以当前真实时间重建自动推进时间线，不删除历史剧本')
+    .action(async ({ session }) => {
+      if (!requireManager(service, session)) return '当前 QQ 没有共享主剧本的管理权限。'
+      if (!await askConfirmation(session, '将清空当前场景摘要、连续性快照和工作暂存，并从现在重新建立宿主时间线；历史剧本和长期事实会保留。确认执行吗？(y/n)')) return '操作已取消。'
+      const story = await requireStory(service, session)
+      if (typeof story === 'string') return story
+      const result = await service.rebaseTimeline(story)
+      return `已在 ${formatLogTime(result.at, story.setting.timezone)} 重建宿主时间线${result.sceneReset ? '，活跃场景摘要已重置' : ''}。`
+    })
+
+  ctx.command('interlude.timeline [limit:number]', '查看当前账号可见的近期剧本记录；limit 为条数，默认 10')
     .action(async ({ session }, limit = 10) => {
       const story = await requireStory(service, session)
       if (typeof story === 'string') return story
@@ -526,10 +577,10 @@ function registerCommands(ctx: Context, service: InterludeService) {
         .filter(entry => !entry.participantId || entry.participantId === participant?.id)
         .slice(-Math.max(1, Math.min(limit, 30)))
       if (!entries.length) return '当前故事还没有剧本记录。'
-      return entries.map(entry => `[${entry.occurredAt.toISOString()}] ${entry.actor}/${entry.kind}: ${entry.content}`).join('\n')
+      return entries.map(entry => `[${formatStoryDisplayTime(entry.occurredAt, story.setting.timezone)}] ${entry.actor}/${entry.kind}: ${entry.content}`).join('\n')
     })
 
-  ctx.command('interlude.memory [limit:number]', '查看主模型提取出的耐久记忆；limit 为条数，默认 10')
+  ctx.command('interlude.memory [limit:number]', '查看当前账号相关的记忆摘要；limit 为条数，默认 10')
     .action(async ({ session }, limit = 10) => {
       const story = await requireStory(service, session)
       if (typeof story === 'string') return story
@@ -539,7 +590,7 @@ function registerCommands(ctx: Context, service: InterludeService) {
       return memories.map(memory => `[${memory.category}/${memory.importance.toFixed(2)}] ${memory.content}`).join('\n')
     })
 
-  ctx.command('interlude.context', '查看场景摘要、剧情弧线、人物变化覆写和长期事实')
+  ctx.command('interlude.context', '查看运行上下文摘要：场景、关系、Overlay 与长期事实')
     .action(async ({ session }) => {
       const story = await requireStory(service, session)
       if (typeof story === 'string') return story
@@ -560,7 +611,7 @@ function registerCommands(ctx: Context, service: InterludeService) {
       ].join('\n')
     })
 
-  ctx.command('interlude.compact', '立即整理一次当前故事的旧剧本；用于测试记忆压缩')
+  ctx.command('interlude.compact', '立即整理当前故事的旧剧本；必要时一并审查 Schedule Preplan')
     .action(async ({ session }) => {
       if (!requireManager(service, session)) return '当前 QQ 没有共享主剧本的管理权限。'
       const story = await requireStory(service, session)
@@ -694,6 +745,36 @@ function registerCommands(ctx: Context, service: InterludeService) {
       const changed = await service.compactOverlay(story)
       return changed ? 'overlay 合并和压缩完成。' : '没有需要合并或压缩的 overlay。'
     })
+
+  ctx.command('interlude.schedule', '查看 Schedule Preplan 当前版本与未来约半天的日程')
+    .action(async ({ session }) => {
+      const story = await requireStory(service, session)
+      if (typeof story === 'string') return story
+      const record = await service.adminSchedulePreplan(story.id)
+      if (!record) return 'Schedule Preplan 尚未生成；后台会在空闲整理时建立。'
+      const window = schedulePreplanWindow(record, new Date(), story.setting.timezone, 12, resolveSchedulePreplanConfig(config.schedulePreplan))
+      return [
+        `Schedule Preplan：版本 ${record.revision}，覆盖 ${record.validFrom} → ${record.validThrough}`,
+        `最后审查：${record.lastReviewedLocalDate || '尚未'}；原因：${record.reviewReason || '无'}`,
+        window?.blocks.length
+          ? window.blocks.map(block => `${block.date} ${block.start}-${block.end} [${block.kind}] ${block.label}${block.location ? ` @ ${block.location}` : ''}`).join('\n')
+          : '未来约半天没有已确定的日程块。',
+      ].join('\n')
+    })
+
+  const requestScheduleRefresh = async (session: Session) => {
+      if (!requireManager(service, session)) return '无权限：当前账号不是 HDSI 管理员。'
+      const story = await requireStory(service, session)
+      if (typeof story === 'string') return story
+      const marked = await service.requestSchedulePreplanRebuild(story.id)
+      return marked ? 'Schedule Preplan 已标记为重新审查；会在当前前台回合结束后的空闲队列中处理。' : '当前还没有 Schedule Preplan；后台会自动建立。'
+  }
+
+  ctx.command('interlude.schedule.refresh', '管理员：重新审查当前 Schedule Preplan，并保留旧计划作为稳定参考')
+    .action(({ session }) => requestScheduleRefresh(session))
+
+  ctx.command('interlude.schedule.rebuild', '管理员：兼容别名，等同于 interlude.schedule.refresh')
+    .action(({ session }) => requestScheduleRefresh(session))
 
   ctx.command('interlude.database.clear', '管理员：清空 HDSI 自有 SQLite 数据表；不会删除 Koishi 用户和其它插件数据；执行前会询问 y/n')
     .action(async ({ session }) => {

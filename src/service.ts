@@ -4,7 +4,7 @@ import { readFile, readdir, stat } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
 import { extname, relative, resolve, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { configuredProviders, createCompactor, createEmbedder, createNarrator, createStickerDescriber, effectiveMainModelId, ModelConfig, StickerDescriber, usesRemoteProviders } from './narrator'
+import { configuredProviders, createCompactor, createEmbedder, createNarrator, createStickerDescriber, createVisionDescriber, effectiveMainModelId, formatTokenUsageLine, ModelConfig, promptVisibleMessageContent, recentScriptOwnership, StickerDescriber, TokenUsageRecord, usesRemoteProviders, VisionDescriber } from './narrator'
 import {
   advanceAlterSystem, alterAnalysisCoolingDown, calculateAlterThreshold, completeAlterAnalysis,
   emotionalOffsetForPrompt, normalizeAlterSystemState, normalizeAlterValue, resolveAlterSystemConfig,
@@ -20,7 +20,12 @@ import { calendarDayKey, formatLogTime, localClockMinutes } from './time'
 import { consumeGroupWillingness, evaluateGroupWillingness, GroupWillingnessConfig, GroupWillingnessState } from './group-willingness'
 import { normalizeQQNativeFaceSegments } from './qq-face'
 import {
-  CompactionDecision, emptyStorySetting, emptyStoryState, IntentDraft, InterludeArc, InterludeScene,
+  applySchedulePreplanProposal, nextSchedulePreplanTransition, normalizeSchedulePreplanRecord,
+  refreshSchedulePreplan, resolveSchedulePreplanConfig, SchedulePreplanConfig, schedulePreplanNeedsModel,
+  schedulePreplanReviewDue, schedulePreplanWindow,
+} from './schedule-preplan'
+import {
+  CompactionDecision, CompactionRequest, emptyStorySetting, emptyStoryState, IntentDraft, InterludeArc, InterludeScene,
   InterludeParticipant, InterludeStory, MemoryDraft, NarrativeDecision, NarrativeFact, NarrativeIntent,
   GroupContext, GroupMessageContext, NarrativeInteraction, NarrativeProvider, NarrativeRequest, NarrativeCompactor,
   ContinuitySnapshot, NarrativeEmbedder, OutgoingMessageDraft, ParticipantState, ScriptEntry, ScriptEntryDraft, StatePatchDraft, StatePatchProposal, StorySetting, StoryState,
@@ -28,8 +33,66 @@ import {
   AlterSystemState, AlterSystemConfig, EmotionalOffsetPrompt,
   AgencyConfig, AgencyWindowState, ProactiveContactDraft, AutomaticDeliverySummary, ScenePresenceDraft, ScenePresenceState,
   ChatActionCapabilities, ChatReactionName, FollowUpCommitmentDraft, FollowUpResolutionDraft, LocalMediaDraft, MessageReactionDraft, NativeFaceSemantic, StickerAsset, StickerCatalogEntry,
-  IndexedQuotedMessageContext, QuotedMessageContext,
+  EarlyNarrativeReply, IndexedQuotedMessageContext, QuotedMessageContext, SchedulePreplanRecord, SchedulePreplanReviewRequest,
+  PreviousSceneSummary, RecalledMoment, WorkingDetail, TimelinePlan, TimelinePlanRequest, UserReportedTime,
 } from './types'
+
+/** Entry kinds whose raw content is eligible for semantic history recall. */
+const RECALLABLE_ENTRY_KINDS = ['user-message', 'character-message', 'script', 'group-message', 'character-group-message']
+
+type HistoryVectorEntry = {
+  vector: number[]
+  content: string
+  occurredAt: string
+  participantId: string
+  kind: string
+}
+
+/** Semantic recall is another view of raw history, so it must obey the same
+ * private-branch boundary as recentScript. Group transcripts are deliberately
+ * excluded from a private turn unless the owner opted into shared details. */
+export function isHistoryEntryVisibleToParticipant(entry: Pick<ScriptEntry, 'participantId' | 'kind'>, participantId: string, shareParticipantDetails: boolean) {
+  if (shareParticipantDetails) return true
+  if (entry.kind === 'group-message' || entry.kind === 'character-group-message') return false
+  return !entry.participantId || entry.participantId === participantId
+}
+
+/** A turn needs a live query vector only for a feature that can actually use
+ * it. An inactive or small sticker library must not silently turn ordinary
+ * fact embedding into a per-message network request. */
+export function shouldRequestTurnEmbedding(embedding: ModelConfig['embedding'] | undefined, stickerLibraryEnabled: boolean, stickerCount: number) {
+  if (!embedding?.enabled) return false
+  return embedding.liveQuery === true
+    || embedding.semanticHistory === true
+    || embedding.semanticStickerFilter === true && stickerLibraryEnabled && stickerCount > SEMANTIC_STICKER_LIMIT
+}
+
+/** After a failed Schedule Preplan generation, wait this long before letting the
+ * daily review request another compactor call. Without this backoff a weak
+ * compaction model that omits the schedule field would trigger one extra LLM
+ * call after every single user turn. */
+const SCHEDULE_PREPLAN_RETRY_BACKOFF = 2 * Time.hour
+
+interface PreparedCompactionSkip {
+  phase: 'skip'
+  overlayCompacted: boolean
+}
+
+interface PreparedCompactionRun {
+  phase: 'run'
+  overlayCompacted: boolean
+  scene: InterludeScene
+  sceneEntries: ScriptEntry[]
+  chars: number
+  sceneCompactionDue: boolean
+  current: InterludeStory
+  participants: InterludeParticipant[]
+  visibleCompactionEntries: ScriptEntry[]
+  visibleCompactionFacts: NarrativeFact[]
+  compactRequest: CompactionRequest
+}
+
+type PreparedCompaction = PreparedCompactionSkip | PreparedCompactionRun
 
 // Only QQ/OneBot CDN hosts are fetched in the native-vision path. This keeps
 // arbitrary user-provided URLs from becoming an internal-network fetch proxy.
@@ -59,6 +122,7 @@ export interface Config {
   stickers?: StickerLibraryConfig
   alterSystem?: AlterSystemConfig
   agency?: AgencyConfig
+  schedulePreplan?: SchedulePreplanConfig
 }
 
 export interface BlindModeConfig {
@@ -116,6 +180,8 @@ export interface StickerLibraryConfig {
   directory: string
   maxFileSizeMB: number
   catalogLimit: number
+  /** API JSON mode is optional; prompt-only still asks for the compact JSON contract. */
+  descriptionResponseFormat?: 'json-object' | 'prompt-only'
 }
 
 export interface GroupChatRule {
@@ -142,6 +208,8 @@ export interface MemoryConfig {
   sceneHookCharacters: number
   sceneSummaryCharacters: number
   arcSummaryCharacters: number
+  /** How many immediately-preceding closed scene summaries join the prompt. */
+  previousSceneSummaries: number
   recentEntryLimit: number
   factLimit: number
   factContentCharacters: number
@@ -190,6 +258,8 @@ export interface RuntimeConfig {
   minimumAdvanceMinutes: number
   maxStoriesPerSweep: number
   contextEntryLimit: number
+  /** Preserve raw entries from this recent time window in addition to the count floor. */
+  contextTimeWindowMinutes?: number
   memoryLimit: number
   maxScriptCharacters: number
   maxMessageCharacters: number
@@ -206,6 +276,8 @@ export interface RuntimeConfig {
   typingBaseDelaySeconds?: number
   typingCharactersPerSecond?: number
   typingMaxDelaySeconds?: number
+  /** Random variation applied to simulated typing delays; 0 keeps deterministic timing. */
+  typingJitterRatio?: number
   /** Wait after the newest user message before starting a writing request. */
   userMessageDebounceSeconds?: number
   /** @deprecated Ignored since 0.1.2; requests remain replaceable until the first reply is committed. */
@@ -337,6 +409,11 @@ export interface ExecutableGroupChatActions {
   reactions: ExecutableMessageReaction[]
 }
 
+interface GroupDeliveryResult {
+  deliveredSegments: string[]
+  complete: boolean
+}
+
 interface DueIntentWake {
   cancel: () => void
   dueAt: number
@@ -394,7 +471,15 @@ export class InterludeService extends Service {
   private compactor: NarrativeCompactor
   private embedder: NarrativeEmbedder
   private stickerDescriber: StickerDescriber
+  private visionDescriber: VisionDescriber
   private stickerCatalog: StickerAsset[] = []
+  /** Whole-table semantic recall cache, one map per story: entry id → vector +
+   * minimal content. Loaded lazily on first recall and extended incrementally
+   * by the background backfill; never persisted. */
+  private historyVectors = new Map<string, Map<number, HistoryVectorEntry>>()
+  private historyVectorsReady = new Set<string>()
+  /** Per-story retry-after timestamps for failed Schedule Preplan generations. */
+  private schedulePreplanBackoff = new Map<string, number>()
   private stickerById = new Map<string, StickerAsset>()
   private stickerScanRunning = false
   /**
@@ -433,15 +518,31 @@ export class InterludeService extends Service {
   private sweepRunning = false
   private compactionSweepRunning = false
   private blindModeHealthIssue = false
+  /** Console reload creates a new service instance, so normalized config can
+   * be cached safely for the lifetime of this instance. */
+  private cachedVoiceTranscriptionConfig?: VoiceTranscriptionConfig
+  private cachedStickerConfig?: StickerLibraryConfig
+  private cachedAlterSystemConfig?: AlterSystemConfig
+  private cachedAgencyConfig?: AgencyConfig
+  private cachedSchedulePreplanConfig?: SchedulePreplanConfig
+  private cachedBlindModeConfig?: BlindModeConfig
+  private cachedAutoAdvanceConfig?: AutoAdvanceConfig
+  private cachedSharedStoryConfig?: SharedStoryConfig
+  private cachedMemoryConfig?: MemoryConfig
+  private cachedBrowserConfig?: BrowserConfig
 
   constructor(ctx: Context, public config: Config) {
     super(ctx, 'interlude')
     this.serviceLogger = ctx.logger('hds-interlude')
     registerTables(ctx)
-    this.narrator = createNarrator(ctx, config.model, this.blindModeConfig.enabled)
-    this.compactor = createCompactor(ctx, config.model, this.blindModeConfig.enabled)
+    // One shared token-usage sink: every chat task (main/compaction/alter/
+    // sticker description) reports through here and lands in the Koishi log.
+    const onUsage = (record: TokenUsageRecord) => this.reportTokenUsage(record)
+    this.narrator = createNarrator(ctx, config.model, this.blindModeConfig.enabled, onUsage)
+    this.compactor = createCompactor(ctx, config.model, this.blindModeConfig.enabled, onUsage)
     this.embedder = createEmbedder(ctx, config.model)
-    this.stickerDescriber = createStickerDescriber(ctx, config.model, this.blindModeConfig.enabled)
+    this.stickerDescriber = createStickerDescriber(ctx, config.model, this.blindModeConfig.enabled, onUsage)
+    this.visionDescriber = createVisionDescriber(ctx, config.model, this.blindModeConfig.enabled, onUsage)
     // Defer timer registration by one event-loop turn. This keeps Console
     // plugin load/reload responsive while preserving the same background work.
     ctx.setTimeout(() => this.startBackgroundTasks(), 0)
@@ -458,7 +559,7 @@ export class InterludeService extends Service {
     // Life advancement and memory compaction are both serialized per story.
     const sweepInterval = Math.max(1, this.config.runtime.sweepIntervalMinutes)
     this.ctx.setInterval(() => void this.sweep().catch(error => this.reportStandalone('warn', '后台推进失败 错误=%s', error)), sweepInterval * Time.minute)
-    if (this.memoryConfig.enabled) this.ctx.setInterval(() => void this.compactStories().catch(error => this.reportStandalone('warn', '后台记忆整理失败 错误=%s', error)), Math.max(1, this.memoryConfig.backgroundIntervalMinutes) * Time.minute)
+    if (this.memoryConfig.enabled || this.schedulePreplanConfig.enabled) this.ctx.setInterval(() => void this.compactStories().catch(error => this.reportStandalone('warn', '后台整理失败 错误=%s', error)), Math.max(1, this.memoryConfig.backgroundIntervalMinutes) * Time.minute)
     if (this.blindModeConfig.enabled) {
       this.ctx.setInterval(() => this.reportBlindModeHealth(), this.blindModeConfig.healthReportMinutes * Time.minute)
     }
@@ -550,8 +651,9 @@ export class InterludeService extends Service {
     if (this.sharedStoryConfig.enabled) {
       // Shared mode deliberately has one canonical active story in the whole
       // Koishi instance. Sandbox and OneBot must not run parallel lives.
-      const existing = await this.getCanonicalStory(storyIdForCharacter(session.platform, session.selfId))
+      let existing = await this.getCanonicalStory(storyIdForCharacter(session.platform, session.selfId))
       if (existing) {
+        existing = await this.repairCanonicalOneBotStoryTransport(existing, session)
         const sharedId = storyIdForCharacter(session.platform, session.selfId)
         if (existing.platform === session.platform && existing.id !== sharedId) return this.migrateLegacyStory(existing, session)
         await this.migrateLegacyBranchIntoShared(existing, session)
@@ -780,6 +882,23 @@ export class InterludeService extends Service {
     return rows.reverse()
   }
 
+  /** Live narration keeps both a count floor and a recent wall-clock window.
+   * A burst of conversation can therefore exceed the nominal turn count
+   * without immediately erasing everything said earlier in the same hour. */
+  private async recentEntriesForPrompt(storyId: string, now: Date) {
+    const count = Math.max(1, Math.min(this.config.runtime.contextEntryLimit ?? 20, 200))
+    const minutes = Math.max(0, Math.min(this.config.runtime.contextTimeWindowMinutes ?? 60, 1_440))
+    const [countRows, timeRows] = await Promise.all([
+      this.dbGet('interlude_script_entry', { storyId }, { limit: count, sort: { occurredAt: 'desc' } }),
+      minutes > 0
+        ? this.dbGet('interlude_script_entry', { storyId, occurredAt: { $gte: new Date(now.getTime() - minutes * Time.minute) } }, { limit: 500, sort: { occurredAt: 'desc' } })
+        : Promise.resolve([] as ScriptEntry[]),
+    ])
+    const byId = new Map<number, ScriptEntry>()
+    for (const entry of [...countRows, ...timeRows]) byId.set(entry.id, entry)
+    return [...byId.values()].sort((left, right) => left.occurredAt.getTime() - right.occurredAt.getTime() || left.id - right.id)
+  }
+
   async memories(storyId: string, limit = this.config.runtime.memoryLimit, participantId?: string) {
     const bounded = Math.max(1, Math.min(limit * 4, 500))
     const rows = await this.dbGet('interlude_memory', { storyId, status: 'active' }, {
@@ -868,6 +987,37 @@ export class InterludeService extends Service {
     return this.serial(story.id, async () => this.clearSettingOverlayUnlocked(await this.getStory(story.id), target))
   }
 
+  /** Start a clean host-owned timeline without deleting the historical archive.
+   * This is intended once after upgrading from prose-authoritative releases
+   * whose active scene or scratchpad may already contain future contamination. */
+  async rebaseTimeline(story: InterludeStory) {
+    this.invalidateBufferedNarratives(story.id)
+    return this.serial(story.id, async () => {
+      const current = await this.getStory(story.id)
+      const now = new Date()
+      const latest = await this.dbGet('interlude_script_entry', { storyId: current.id }, { limit: 1, sort: { id: 'desc' } }) as ScriptEntry[]
+      const activeScene = await this.activeScene(current.id)
+      if (activeScene) {
+        await this.dbSet('interlude_scene', { id: activeScene.id }, {
+          hook: `Host timeline rebased at ${formatLogTime(now, current.setting.timezone)}.`,
+          summary: 'The host resumed the current timeline here. Earlier script remains archived context; no future statement from it is an event after this point.',
+          lastEntryId: latest[0]?.id ?? activeScene.lastEntryId,
+          entryCount: 0,
+          updatedAt: now,
+        })
+      }
+      const state = normalizeStoryState(current.state)
+      await this.dbSet('interlude_story', { id: current.id }, {
+        state: { ...state, workingDetails: [], timelineCarry: [], continuitySnapshot: undefined, continuityDirty: true }, cursorAt: now, updatedAt: now,
+      })
+      await this.appendEntry(current.id, {
+        kind: 'timeline-rebase', actor: 'system', content: 'Host timeline rebased. Earlier narrative prose remains an archive and no longer defines future events.',
+        occurredAt: now.toISOString(), metadata: { timelineRebase: true },
+      }, now)
+      return { at: now, sceneReset: !!activeScene }
+    })
+  }
+
   private async clearSettingOverlayUnlocked(story: InterludeStory, target: 'character' | 'perspective' | 'relationship' | 'world' | 'all') {
     const now = new Date()
     const overlay = { ...(story.state.settingOverlay ?? {}) }
@@ -929,6 +1079,7 @@ export class InterludeService extends Service {
     await this.purgeTable('interlude_state_patch', { storyId }, { status: 'rejected', proposedValue: '[管理员已删除提案]', evidence: '' })
     await this.purgeTable('interlude_overlay_snapshot', { storyId }, { status: 'superseded', summary: '[管理员已删除 overlay 归档]', majorEvents: [], sourcePatchIds: [] })
     await this.purgeTable('interlude_web_observation', { storyId }, { status: 'deleted', url: '', title: '', excerpt: '', summary: '[管理员已删除网页观察]' })
+    await this.purgeTable('interlude_schedule_preplan', { storyId }, { regimes: [], exceptions: [], materializedDays: [], validFrom: '1970-01-01', validThrough: '1970-01-01', lastReviewedLocalDate: '', reviewReason: '[管理员已删除 Schedule Preplan]' })
     const now = new Date()
     const story = await this.getStory(storyId)
     const setting = this.initialStorySetting()
@@ -974,10 +1125,11 @@ export class InterludeService extends Service {
     if (this.databaseResetting) throw new Error('HDSI 数据库清空已经在进行中。')
     this.databaseResetting = true
     this.invalidateBufferedNarratives()
+    this.invalidateHistoryVectors()
     try {
     const tables = [
       'interlude_script_entry', 'interlude_memory', 'interlude_intent',
-      'interlude_scene', 'interlude_arc', 'interlude_fact', 'interlude_state_patch', 'interlude_overlay_snapshot', 'interlude_web_observation',
+      'interlude_scene', 'interlude_arc', 'interlude_fact', 'interlude_state_patch', 'interlude_overlay_snapshot', 'interlude_web_observation', 'interlude_schedule_preplan',
       'interlude_participant', 'interlude_story',
     ] as const
     let removed = 0
@@ -994,6 +1146,7 @@ export class InterludeService extends Service {
         this.reportStandalone('warn', 'SQLite 清空表失败，改用逻辑清空 表=%s 错误=%s', table, error)
         for (const row of rows) {
           const id = (row as any).id
+          const key = table === 'interlude_schedule_preplan' ? { storyId: (row as any).storyId } : { id }
           const fallback: any = table === 'interlude_story'
             ? { status: 'archived', setting: this.initialStorySetting(), state: emptyStoryState() }
             : table === 'interlude_participant'
@@ -1010,8 +1163,10 @@ export class InterludeService extends Service {
                         ? { status: 'superseded', content: '[HDSI 数据库已清空]' }
                         : table === 'interlude_web_observation'
                           ? { status: 'deleted', url: '', title: '', excerpt: '', summary: '[HDSI 数据库已清空]' }
+                        : table === 'interlude_schedule_preplan'
+                          ? { regimes: [], exceptions: [], materializedDays: [], validFrom: '1970-01-01', validThrough: '1970-01-01', lastReviewedLocalDate: '', reviewReason: '[HDSI 数据库已清空]' }
                         : { status: 'rejected', proposedValue: '[HDSI 数据库已清空]', evidence: '' }
-          await this.dbSet(table, { id }, fallback)
+          await this.dbSet(table, key, fallback)
           logicallyCleared++
         }
       }
@@ -1025,6 +1180,7 @@ export class InterludeService extends Service {
   /** Remove script and derived memory records whose timestamps overlap a range. */
   async purgeStoryRange(storyId: string, from: Date, to: Date) {
     this.invalidateBufferedNarratives(storyId)
+    this.invalidateHistoryVectors(storyId)
     const inRange = (value: Date | null | undefined) => !!value && value >= from && value <= to
     const entries = await this.dbGet('interlude_script_entry', { storyId })
     const entryIds = new Set(entries.filter(entry => inRange(entry.occurredAt)).map(entry => entry.id))
@@ -1070,6 +1226,12 @@ export class InterludeService extends Service {
       if (inRange(observation.createdAt) || inRange(observation.accessedAt)) {
         await this.purgeTable('interlude_web_observation', { id: observation.id }, { status: 'deleted', url: '', title: '', excerpt: '', summary: '[管理员已删除网页观察]' })
       }
+    }
+
+    if (entryIds.size) {
+      await this.dbSet('interlude_schedule_preplan', { storyId }, {
+        lastReviewedLocalDate: '', validThrough: '1970-01-01', reviewReason: 'Source range was purged; Schedule Preplan requires review.', updatedAt: new Date(),
+      })
     }
 
     const story = await this.getStory(storyId)
@@ -1246,6 +1408,9 @@ export class InterludeService extends Service {
       return
     }
     turn.timer = undefined
+    // Unlike private turns, a group batch stays deliverable after its model
+    // request has started. New group messages form the next batch so a busy
+    // conversation cannot permanently starve the protagonist of a reply.
     const batch = turn.messages.splice(0)
     if (!batch.length) {
       this.bufferedGroupTurns.delete(key)
@@ -1297,9 +1462,12 @@ export class InterludeService extends Service {
         messages: snapshot.contextMessages,
       }
       const chatCapabilities = this.groupChatCapabilities(turn.latestSession, groupContext.messages)
-      const stickerCatalog = this.stickerCatalogForSession(turn.latestSession)
       const userMessage = batch.map((message, index) => `[群聊连续消息 ${index + 1}｜${message.speaker}]\n${message.content}`).join('\n\n')
-      const { decision, succeeded } = await this.tryDecide(snapshot.story, null, 'user-message', snapshot.from, snapshot.now, userMessage, [], [], groupContext, [], chatCapabilities, [], stickerCatalog)
+      const turnQueryEmbedding = this.semanticTurnEmbeddingEnabled()
+        ? await this.embedText(userMessage.slice(0, this.config.model.embedding?.maxInputCharacters ?? 4_000))
+        : undefined
+      const stickerCatalog = await this.stickerCatalogForSession(turn.latestSession, turnQueryEmbedding)
+      const { decision, succeeded } = await this.tryDecide(snapshot.story, null, 'user-message', snapshot.from, snapshot.now, userMessage, [], [], groupContext, [], chatCapabilities, [], stickerCatalog, turnQueryEmbedding)
       const chatActions = normalizeGroupChatActions(decision, chatCapabilities, groupContext)
       const sticker = this.resolveSticker(decision.localMedia, stickerCatalog)
       const nativeFace = sticker ? undefined : this.resolveNativeFace(decision, chatCapabilities)
@@ -1308,16 +1476,6 @@ export class InterludeService extends Service {
         const current = await this.getStory(story.id)
         const messages = await this.persistDecision(current, null, decision, snapshot.from, snapshot.now, false, 'user-message')
         const content = normalizeGroupVisibleReply(decision.groupReply, decision.interaction, this.config.runtime.maxMessageCharacters)
-        if (content) {
-          await this.appendEntry(current.id, {
-            kind: 'character-group-message', actor: 'character', content,
-            occurredAt: snapshot.now.toISOString(),
-            metadata: {
-              groupId: turn.groupId, channelId: turn.channelId,
-              ...(chatActions.replyTo ? { replyTo: chatActions.replyTo.messageRef } : {}),
-            },
-          }, snapshot.now)
-        }
         await this.dbSet('interlude_story', { id: current.id }, { cursorAt: snapshot.now, updatedAt: new Date() })
         if (succeeded) await this.scheduleConversationFollowUpsAfterTurn(current.id, snapshot.now, decision.interaction)
         return { content, messages, chatActions, sticker, nativeFace }
@@ -1325,14 +1483,33 @@ export class InterludeService extends Service {
       const completedReactions = result.chatActions.reactions.length && turn.latestSession
         ? await this.executeGroupReactions(snapshot.story, turn.latestSession, turn.groupId, result.chatActions.reactions)
         : 0
-      if (result.content || completedReactions || result.sticker || result.nativeFace) {
+      const groupDelivery: GroupDeliveryResult = result.content
+        ? await this.sendGroupMessage(snapshot.story, turn.channelId, result.content, result.chatActions.replyTo?.messageId, turn.latestSession)
+        : { deliveredSegments: [], complete: false }
+      if (groupDelivery.deliveredSegments.length) {
+        await this.serial(story.id, async () => {
+          const current = await this.getStory(story.id)
+          const now = new Date()
+          await this.appendEntry(current.id, {
+            kind: 'character-group-message', actor: 'character', content: groupDelivery.deliveredSegments.join('<sep/>'),
+            occurredAt: now.toISOString(),
+            metadata: {
+              groupId: turn.groupId, channelId: turn.channelId,
+              ...(groupDelivery.complete ? {} : { partialDelivery: true, deliveredSegments: groupDelivery.deliveredSegments.length }),
+              ...(result.chatActions.replyTo ? { replyTo: result.chatActions.replyTo.messageRef } : {}),
+            },
+          }, now)
+        })
+      }
+      const stickerDelivered = result.sticker && turn.latestSession
+        ? await this.sendSticker(snapshot.story, turn.latestSession, turn.channelId, result.sticker, turn.groupId)
+        : false
+      const nativeFaceDelivered = result.nativeFace && turn.latestSession
+        ? await this.sendNativeFace(snapshot.story, turn.latestSession, turn.channelId, result.nativeFace, turn.groupId)
+        : false
+      if (groupDelivery.deliveredSegments.length || completedReactions || stickerDelivered || nativeFaceDelivered) {
         this.groupWillingness.set(key, consumeGroupWillingness(this.groupWillingness.get(key), turn.rule.willingness, Date.now()))
       }
-      if (result.content) {
-        await this.sendGroupMessage(snapshot.story, turn.channelId, result.content, result.chatActions.replyTo?.messageId)
-      }
-      if (result.sticker && turn.latestSession) await this.sendSticker(snapshot.story, turn.latestSession, turn.channelId, result.sticker)
-      if (result.nativeFace && turn.latestSession) await this.sendNativeFace(snapshot.story, turn.latestSession, turn.channelId, result.nativeFace)
       this.scheduleCompaction(story.id)
     } catch (error) {
       this.report('warn', story, 'user-message', '群聊主叙事失败，保持静默 群=%s 错误=%s', turn.groupId, error)
@@ -1445,11 +1622,11 @@ export class InterludeService extends Service {
     return undefined
   }
 
-  private async sendSticker(story: InterludeStory, session: Session, channelId: string, asset: StickerAsset) {
+  private async sendSticker(story: InterludeStory, session: Session, channelId: string, asset: StickerAsset, groupId?: string) {
     const root = resolve(this.ctx.baseDir, this.stickerConfig.directory)
     const file = resolve(root, asset.filePath)
     const relativePath = relative(root, file)
-    if (!relativePath || relativePath === '..' || relativePath.startsWith(`..${sep}`) || relativePath.includes(':')) return
+    if (!relativePath || relativePath === '..' || relativePath.startsWith(`..${sep}`) || relativePath.includes(':')) return false
     try {
       await session.bot.sendMessage(channelId, h('img', { src: pathToFileURL(file).href }))
       const now = new Date()
@@ -1457,42 +1634,61 @@ export class InterludeService extends Service {
         kind: 'character-platform-action', actor: 'character',
         content: `主角发送了本地表情包：${asset.description}`,
         occurredAt: now.toISOString(),
-        metadata: { platform: session.platform, action: 'local-sticker', assetId: asset.assetId, group: asset.group, animated: asset.animated },
+        metadata: { platform: session.platform, action: 'local-sticker', assetId: asset.assetId, group: asset.group, animated: asset.animated, ...(groupId ? { groupId } : {}) },
       }, now))
       this.reportOperation('standard', 'info', story, 'user-message', '聊天动作完成 类型=本地表情包 素材=%s', asset.assetId)
+      return true
     } catch (error) {
       this.report('warn', story, 'user-message', '聊天动作失败 类型=本地表情包 素材=%s 错误=%s', asset.assetId, error)
+      return false
     }
   }
 
-  private async sendNativeFace(story: InterludeStory, session: Session, channelId: string, semantic: NativeFaceSemantic) {
+  private async sendNativeFace(story: InterludeStory, session: Session, channelId: string, semantic: NativeFaceSemantic, groupId?: string) {
     try {
       await session.bot.sendMessage(channelId, h('face', { id: QQ_NATIVE_FACE_IDS[semantic] }))
       const now = new Date()
       await this.serial(story.id, async () => this.appendEntry(story.id, {
         kind: 'character-platform-action', actor: 'character', content: `主角发送了 ${semantic} 原生表情。`,
-        occurredAt: now.toISOString(), metadata: { platform: session.platform, action: 'native-face', semantic },
+        occurredAt: now.toISOString(), metadata: { platform: session.platform, action: 'native-face', semantic, ...(groupId ? { groupId } : {}) },
       }, now))
       this.reportOperation('standard', 'info', story, 'user-message', '聊天动作完成 类型=原生表情 语义=%s', semantic)
+      return true
     } catch (error) {
       this.report('warn', story, 'user-message', '聊天动作失败 类型=原生表情 语义=%s 错误=%s', semantic, error)
+      return false
     }
   }
 
-  private async sendGroupMessage(story: InterludeStory, channelId: string, content: string, replyToMessageId?: string) {
-    const bot = this.ctx.bots.find(item => String(item.selfId) === String(story.selfId)
+  private async sendGroupMessage(story: InterludeStory, channelId: string, content: string, replyToMessageId?: string, session?: Session) {
+    // The live group session is authoritative: it already represents the bot
+    // account that received this exact group message. Shared stories may have
+    // been created under an old account or platform and must not override it.
+    const sessionBot = session?.bot && typeof (session.bot as any).sendMessage === 'function'
+      ? session.bot
+      : undefined
+    const bot = sessionBot ?? this.ctx.bots.find(item => String(item.selfId) === String(story.selfId)
       && (item.platform === story.platform || isOneBotPlatform(item.platform) && isOneBotPlatform(story.platform)))
     if (!bot) {
-      this.report('warn', story, 'user-message', '没有可用机器人账号投递群消息 群频道=%s', channelId)
-      return
+      this.report('warn', story, 'user-message', '没有可用机器人账号投递群消息 群频道=%s 故事平台=%s 故事账号=%s', channelId, story.platform, story.selfId)
+      return { deliveredSegments: [], complete: false }
     }
+    let allDelivered = true
+    const deliveredSegments: string[] = []
     for (const [index, segment] of this.splitOutgoingMessage(content).entries()) {
       const outgoing = index === 0 && replyToMessageId
         ? [h('quote', { id: replyToMessageId }), segment]
         : segment
-      try { await bot.sendMessage(channelId, outgoing) }
-      catch (error) { this.report('warn', story, 'user-message', '群消息投递失败 群频道=%s 错误=%s', channelId, error) }
+      try {
+        await bot.sendMessage(channelId, outgoing)
+        deliveredSegments.push(segment)
+      }
+      catch (error) {
+        allDelivered = false
+        this.report('warn', story, 'user-message', '群消息投递失败 群频道=%s 错误=%s', channelId, error)
+      }
     }
+    return { deliveredSegments, complete: allDelivered }
   }
 
   /**
@@ -1528,22 +1724,51 @@ export class InterludeService extends Service {
       '新消息到达且首条回复尚未提交，放弃旧请求 参与者=%s 请求=%d', participant.id, turn.inFlightRequestId)
   }
 
+  /** Experimental streaming path: only a complete, validated private reply
+   * may leave early. It commits the existing interruption boundary at the
+   * same moment as ordinary first-message delivery. */
+  private async deliverEarlyPrivateReply(
+    story: InterludeStory,
+    participant: InterludeParticipant,
+    session: Session | undefined,
+    turn: BufferedNarrativeTurn,
+    requestId: number,
+    reply: EarlyNarrativeReply,
+  ) {
+    if (reply.kind !== 'private' || !reply.interaction || reply.interaction.reply.mode !== 'immediate') return false
+    if (turn.nextRevision !== requestId || turn.obsoleteRequestIds.has(requestId) || turn.firstMessageCommittedRequestId === requestId) return false
+    if (!this.canHandleParticipant(participant)) return false
+    const content = reply.interaction.reply.content?.trim() || ''
+    if (!content || this.splitOutgoingMessage(content).length !== 1) return false
+    const delivered = await this.sendOutgoingMessages(story, [{
+      participantId: participant.id, content, interaction: reply.interaction, userInitiated: true,
+    }], participant, session)
+    if (!delivered.length) return false
+    await this.confirmOutgoingDeliveries(story, delivered)
+    turn.firstMessageCommittedRequestId = requestId
+    this.reportOperation('standard', 'info', story, 'user-message', '实验性流式首条回复已提前投递 参与者=%s 请求=%d', participant.id, requestId)
+    return true
+  }
+
   /** Extract structured image segments without treating them as a second event. */
   private get voiceTranscriptionConfig(): VoiceTranscriptionConfig {
+    if (this.cachedVoiceTranscriptionConfig) return this.cachedVoiceTranscriptionConfig
     const configured = this.config.onebot?.voiceTranscription
-    return {
+    return this.cachedVoiceTranscriptionConfig = {
       enabled: configured?.enabled === true,
       timeoutMs: Math.max(1_000, Math.min(60_000, Number(configured?.timeoutMs) || 20_000)),
     }
   }
 
   private get stickerConfig(): StickerLibraryConfig {
+    if (this.cachedStickerConfig) return this.cachedStickerConfig
     const configured = this.config.stickers
-    return {
+    return this.cachedStickerConfig = {
       enabled: configured?.enabled === true,
       directory: String(configured?.directory || 'data/hds-interlude/stickers').trim(),
       maxFileSizeMB: Math.max(1, Math.min(30, Number(configured?.maxFileSizeMB) || 10)),
       catalogLimit: Math.max(1, Math.min(80, Math.floor(Number(configured?.catalogLimit) || 40))),
+      descriptionResponseFormat: configured?.descriptionResponseFormat === 'prompt-only' ? 'prompt-only' : 'json-object',
     }
   }
 
@@ -1573,23 +1798,29 @@ export class InterludeService extends Service {
         const filePath = relative(root, file).replace(/\\/g, '/')
         if (!filePath || filePath.startsWith('../')) continue
         seen.add(filePath)
-        const info = await stat(file)
-        if (info.size > config.maxFileSizeMB * 1024 * 1024) continue
-        const bytes = await readFile(file)
-        const hash = createHash('sha256').update(bytes).digest('hex')
-        const prior = byPath.get(filePath)
-        if (prior?.hash === hash && prior.status === 'active') continue
-        const group = filePath.includes('/') ? filePath.split('/')[0] : 'default'
-        const assetId = filePath.replace(/\.[^.]+$/, '').replace(/[^a-zA-Z0-9/_-]/g, '-').slice(0, 255)
-        const now = new Date()
-        const base = {
-          assetId, filePath, group: group.slice(0, 128), mimeType: stickerMime(filePath), animated: /\.gif$/i.test(filePath),
-          size: bytes.length, hash, description: '', aliases: [], status: 'pending' as const, updatedAt: now,
+        try {
+          const info = await stat(file)
+          if (info.size > config.maxFileSizeMB * 1024 * 1024) continue
+          const bytes = await readFile(file)
+          const hash = createHash('sha256').update(bytes).digest('hex')
+          const prior = byPath.get(filePath)
+          if (prior?.hash === hash && prior.status === 'active') continue
+          const group = filePath.includes('/') ? filePath.split('/')[0] : 'default'
+          const assetId = stableStickerAssetId(filePath, hash)
+          const now = new Date()
+          const base = {
+            assetId, filePath, group: group.slice(0, 128), mimeType: stickerMime(filePath), animated: /\.gif$/i.test(filePath),
+            size: bytes.length, hash, description: '', aliases: [], status: 'pending' as const, updatedAt: now,
+          }
+          const asset = prior
+            ? await this.dbSet('interlude_sticker', { id: prior.id }, base).then(() => ({ ...prior, ...base }))
+            : await this.dbCreate('interlude_sticker', { ...base, createdAt: now }) as StickerAsset
+          pending.push({ asset, bytes })
+        } catch (error) {
+          // A malformed file, old duplicate row, or transient SQLite write must
+          // not starve the rest of the library for another five-minute cycle.
+          this.reportStandaloneOperation('standard', 'warn', '表情包素材跳过 文件=%s 错误=%s', filePath, error)
         }
-        const asset = prior
-          ? await this.dbSet('interlude_sticker', { id: prior.id }, base).then(() => ({ ...prior, ...base }))
-          : await this.dbCreate('interlude_sticker', { ...base, createdAt: now }) as StickerAsset
-        pending.push({ asset, bytes })
       }
       for (const asset of existing) {
         if (asset.status !== 'missing' && !seen.has(asset.filePath)) await this.dbSet('interlude_sticker', { id: asset.id }, { status: 'missing', updatedAt: new Date() })
@@ -1600,13 +1831,21 @@ export class InterludeService extends Service {
       for (const item of pending.slice(0, 5)) {
         if (!this.stickerDescriber.available()) break
         const visual = await this.imageBytesToNative(item.bytes, item.asset.mimeType)
-        const description = visual && await this.stickerDescriber.describeSticker(visual.dataUri, visual.mimeType, item.asset.filePath, item.asset.animated)
+        const description = visual && await this.stickerDescriber.describeSticker(visual.dataUri, visual.mimeType, item.asset.filePath, item.asset.animated, config.descriptionResponseFormat)
         if (!description) continue
-        await this.dbSet('interlude_sticker', { id: item.asset.id }, {
+        const updated = await this.dbSet('interlude_sticker', { id: item.asset.id }, {
           description: description.description, aliases: description.aliases, status: 'active', updatedAt: new Date(),
-        })
+        }) as StickerAsset | undefined
+        if (updated && this.semanticStickerEmbeddingEnabled()) {
+          // Index a freshly described asset immediately so the semantic filter
+          // can consider it on the very next turn instead of the next scan.
+          const embedding = await this.embedText(`${description.description} ${description.aliases.join(' ')}`.trim())
+          if (embedding.length) await this.dbSet('interlude_sticker', { id: item.asset.id }, { embedding, updatedAt: new Date() })
+        }
         this.reportStandaloneOperation('standard', 'info', '表情包描述完成 素材=%s 分组=%s', item.asset.assetId, item.asset.group)
       }
+      await this.refreshStickerCatalog()
+      await this.backfillStickerEmbeddings()
       await this.refreshStickerCatalog()
     } catch (error) {
       this.reportStandalone('warn', '表情包库扫描失败：%s', error)
@@ -1621,12 +1860,166 @@ export class InterludeService extends Service {
     this.stickerById = new Map(rows.map(item => [item.assetId, item]))
   }
 
-  private stickerCatalogForSession(session: Session | undefined): StickerCatalogEntry[] {
+  private semanticStickerEmbeddingEnabled() {
+    return this.config.model.embedding?.semanticStickerFilter === true
+  }
+
+  /** Vectorize described-but-unindexed sticker assets in the background. The
+   * batch stays small so one scan cannot spend more than a handful of calls. */
+  private async backfillStickerEmbeddings() {
+    if (!this.semanticStickerEmbeddingEnabled()) return
+    const pending = this.stickerCatalog
+      .filter(asset => asset.description && !asset.embedding?.length)
+      .slice(0, 8)
+    for (const asset of pending) {
+      const text = `${asset.description} ${(asset.aliases ?? []).join(' ')}`.trim()
+      const embedding = await this.embedText(text)
+      if (embedding.length) await this.dbSet('interlude_sticker', { id: asset.id }, { embedding, updatedAt: new Date() })
+    }
+  }
+
+  private async stickerCatalogForSession(session: Session | undefined, turnQueryEmbedding?: number[]): Promise<StickerCatalogEntry[]> {
     const config = this.stickerConfig
     if (!config.enabled || !session || !isOneBotPlatform(session.platform)) return []
-    return this.stickerCatalog.slice(0, config.catalogLimit).map(asset => ({
+    const assets = await this.rankStickerAssets(turnQueryEmbedding)
+    return assets.map(asset => ({
       assetId: asset.assetId, group: asset.group, description: asset.description, aliases: Array.isArray(asset.aliases) ? asset.aliases : [], animated: asset.animated,
     }))
+  }
+
+  /** Semantically narrow the sticker catalog to the entries most relevant to the
+   * live message. Falls back to the full catalog whenever the feature is off,
+   * the turn has no query vector, or the catalog is below the limit. */
+  private async rankStickerAssets(turnQueryEmbedding?: number[]): Promise<StickerAsset[]> {
+    const assets = this.stickerCatalog.slice(0, this.stickerConfig.catalogLimit)
+    if (!this.config.model.embedding?.semanticStickerFilter) return assets
+    if (!turnQueryEmbedding?.length || assets.length <= SEMANTIC_STICKER_LIMIT) return assets
+    return rankStickerCatalog(assets, turnQueryEmbedding, SEMANTIC_STICKER_LIMIT)
+  }
+
+  private semanticTurnEmbeddingEnabled() {
+    return shouldRequestTurnEmbedding(
+      this.config.model.embedding,
+      this.stickerConfig.enabled,
+      this.stickerCatalog.length,
+    )
+  }
+
+  /** Compact summaries of the scenes immediately before the active one. They
+   * bridge the raw context window and the arc, where last-turn details used to
+   * disappear from the prompt entirely. */
+  private async previousSceneSummaries(storyId: string): Promise<PreviousSceneSummary[]> {
+    const limit = this.memoryConfig.previousSceneSummaries
+    if (!limit || !this.memoryConfig.enabled) return []
+    const rows = await this.dbGet('interlude_scene', { storyId, status: 'closed' }, {
+      limit, sort: { endedAt: 'desc' },
+    }) as InterludeScene[]
+    return rows
+      .filter(scene => scene.summary.trim() && scene.endedAt)
+      .map(scene => ({
+        startedAt: scene.startedAt.toISOString(),
+        endedAt: (scene.endedAt ?? scene.startedAt).toISOString(),
+        summary: scene.summary.slice(0, 2_000),
+      }))
+  }
+
+  /** Drop expired scratchpad entries and cap the list; details only ever carry
+   * small in-flight facts, so silence is the correct treatment for expiry. */
+  private pruneWorkingDetails(details: WorkingDetail[] | undefined, now: Date): WorkingDetail[] | undefined {
+    if (!details?.length) return undefined
+    const live = details.filter(item => !item.expiresAt || new Date(item.expiresAt) > now)
+    return live.length ? live.slice(-10) : undefined
+  }
+
+  /** Semantic recall over the story's whole raw history. Vectors are loaded
+   * once per story into memory and extended incrementally by the backfill;
+   * entries already inside recentScript are excluded by id. */
+  private async recallHistory(storyId: string, participantId: string, turnQueryEmbedding: number[], excludeIds: Set<number>): Promise<RecalledMoment[]> {
+    await this.ensureHistoryVectors(storyId)
+    const cache = this.historyVectors.get(storyId)
+    if (!cache?.size) return []
+    const scored: Array<{ id: number, score: number, occurredAt: string, content: string }> = []
+    for (const [id, item] of cache) {
+      if (excludeIds.has(id)) continue
+      if (!isHistoryEntryVisibleToParticipant(item, participantId, this.sharedStoryConfig.shareParticipantDetails)) continue
+      const score = cosineSimilarity(turnQueryEmbedding, item.vector)
+      if (score == null || score < 0.25) continue
+      scored.push({ id, score, occurredAt: item.occurredAt, content: item.content })
+    }
+    return scored
+      .sort((left, right) => right.score - left.score)
+      .slice(0, 3)
+      .map(item => ({
+        id: item.id, occurredAt: item.occurredAt,
+        content: item.content.length > 300 ? `${item.content.slice(0, 300)}…` : item.content,
+      }))
+  }
+
+  /** Load every embedded entry of one story into the recall cache. The load is
+   * deliberately whole-table (no time window): older memories stay retrievable,
+   * and the per-process cache makes the cost one-off per story. */
+  private async ensureHistoryVectors(storyId: string) {
+    if (this.historyVectorsReady.has(storyId)) return
+    this.historyVectorsReady.add(storyId)
+    const cache = new Map<number, HistoryVectorEntry>()
+    this.historyVectors.set(storyId, cache)
+    try {
+      const rows = await this.dbGet('interlude_script_entry', { storyId }) as ScriptEntry[]
+      for (const row of rows) {
+        if (!row.embedding?.length) continue
+        if (!RECALLABLE_ENTRY_KINDS.includes(row.kind)) continue
+        cache.set(row.id, {
+          vector: row.embedding,
+          content: promptVisibleMessageContent(row.content, recentScriptOwnership(row)),
+          occurredAt: row.occurredAt.toISOString(),
+          participantId: row.participantId,
+          kind: row.kind,
+        })
+      }
+    } catch (error) {
+      this.historyVectorsReady.delete(storyId)
+      this.reportStandaloneOperation('diagnostic', 'debug', '历史向量缓存加载失败 错误=%s', error)
+    }
+  }
+
+  /** Drop in-memory copies whenever their source rows are removed or redacted.
+   * The next recall reloads only the surviving database rows. */
+  private invalidateHistoryVectors(storyId?: string) {
+    if (storyId) {
+      this.historyVectors.delete(storyId)
+      this.historyVectorsReady.delete(storyId)
+      return
+    }
+    this.historyVectors.clear()
+    this.historyVectorsReady.clear()
+  }
+
+  /** Background vectorization for semantic history recall. Newest entries go
+   * first so live-recall quality ramps up quickly; the whole table is covered
+   * gradually over successive maintenance passes. */
+  private async backfillHistoryEmbeddings(storyId: string) {
+    if (!this.config.model.embedding?.semanticHistory) return
+    const batchSize = this.config.model.embedding.backfillBatchSize ?? 5
+    if (batchSize <= 0) return
+    const rows = await this.dbGet('interlude_script_entry', { storyId }, {
+      limit: 4_000, sort: { occurredAt: 'desc' },
+    }) as ScriptEntry[]
+    const cache = this.historyVectors.get(storyId)
+    const pending = rows
+      .filter(row => !row.embedding?.length && RECALLABLE_ENTRY_KINDS.includes(row.kind) && row.content.trim())
+      .slice(0, Math.max(8, batchSize * 3))
+    for (const row of pending) {
+      const embedding = await this.embedText(row.content.slice(0, this.config.model.embedding?.maxInputCharacters ?? 4_000))
+      if (!embedding.length) continue
+      await this.dbSet('interlude_script_entry', { id: row.id }, { embedding })
+      cache?.set(row.id, {
+        vector: embedding,
+        content: promptVisibleMessageContent(row.content, recentScriptOwnership(row)),
+        occurredAt: row.occurredAt.toISOString(),
+        participantId: row.participantId,
+        kind: row.kind,
+      })
+    }
   }
 
   private async transcribeVoiceEvent(story: InterludeStory, session: Session) {
@@ -1686,6 +2079,28 @@ export class InterludeService extends Service {
     return images
   }
 
+  /** Sidecar vision mirrors native image acquisition, but sends only its
+   * factual result into the text narrator's current event. */
+  private async describeCurrentImages(story: InterludeStory, images: NarrativeImage[], userMessage: string | undefined) {
+    if (!images.length) return undefined
+    if (!this.visionDescriber.available()) {
+      this.reportOperation('diagnostic', 'warn', story, 'user-message', '侧端识图跳过：没有配置 useForVision 的视觉模型')
+      return undefined
+    }
+    try {
+      const observations = await this.visionDescriber.describeImages(images, userMessage, this.config.model.vision?.detail ?? 'auto')
+      if (observations?.length) {
+        this.reportOperation('diagnostic', 'debug', story, 'user-message', '侧端识图完成 图片=%d 观察=%d', images.length, observations.length)
+      } else {
+        this.reportOperation('diagnostic', 'warn', story, 'user-message', '侧端识图未返回内容，已继续处理文字消息')
+      }
+      return observations
+    } catch (error) {
+      this.reportOperation('diagnostic', 'warn', story, 'user-message', '侧端识图失败，已继续处理文字消息 错误=%s', error)
+      return undefined
+    }
+  }
+
   private async fetchNativeImage(source: string, bot?: any, adapterProvided = false): Promise<{ mimeType: string, dataUri: string } | undefined> {
     const value = String(source ?? '').trim()
     if (value.startsWith('onebot-url:')) {
@@ -1743,7 +2158,46 @@ export class InterludeService extends Service {
       if (frame) return frame
       this.reportStandalone('warn', '动态图片未能抽帧，已使用原始图片输入；请启用 Puppeteer 以提高识别兼容性。')
     }
-    return { mimeType: normalized, dataUri }
+    const scaled = await this.downscaleImageForVision({ mimeType: normalized, dataUri })
+    return scaled ?? { mimeType: normalized, dataUri }
+  }
+
+  /** Re-render a static image through Puppeteer capped at the configured vision
+   * dimension. Multimodal providers tile large images into many tokens, so a
+   * bounded re-encode saves both upload time and per-turn token cost; the
+   * browser also applies EXIF orientation, fixing rotated phone photos. */
+  private async downscaleImageForVision(image: { mimeType: string, dataUri: string }): Promise<{ mimeType: string, dataUri: string } | undefined> {
+    const maxDimension = this.config.model.vision?.maxImageDimension ?? 0
+    if (!maxDimension || !shouldDownscaleImage(image.mimeType, image.dataUri)) return undefined
+    const puppeteer = (this.ctx as any).puppeteer
+    if (!puppeteer?.page) return undefined
+    return this.withBrowserSlot(async () => {
+      let page: any
+      try {
+        page = await puppeteer.page()
+        await page.setViewport({ width: maxDimension, height: maxDimension, deviceScaleFactor: 1 })
+        await page.setContent(`<img id="hdsi-vision" src="${image.dataUri}" style="display:block;max-width:${maxDimension}px;max-height:${maxDimension}px">`, { waitUntil: 'load', timeout: 10_000 })
+        await page.evaluate(() => new Promise<void>(resolve => {
+          const imageElement = document.querySelector('#hdsi-vision') as HTMLImageElement | null
+          if (!imageElement || imageElement.complete) return resolve()
+          imageElement.addEventListener('load', () => resolve(), { once: true })
+          imageElement.addEventListener('error', () => resolve(), { once: true })
+        }))
+        const element = await page.$('#hdsi-vision')
+        if (!element) return undefined
+        const buffer = Buffer.from(await element.screenshot({ type: 'jpeg', quality: 85 }))
+        if (!buffer.length) return undefined
+        const originalBytes = Buffer.from(image.dataUri.split(',')[1] ?? '', 'base64').length
+        if (buffer.length >= originalBytes) return undefined
+        this.reportStandaloneOperation('diagnostic', 'debug', '视觉图片已降采样 原始=%dB 降采样后=%dB 上限=%dpx', originalBytes, buffer.length, maxDimension)
+        return { mimeType: 'image/jpeg', dataUri: `data:image/jpeg;base64,${buffer.toString('base64')}` }
+      } catch (error) {
+        this.reportStandalone('debug', '视觉图片降采样失败，已透传原图：%s', error)
+        return undefined
+      } finally {
+        if (page) await page.close().catch(() => undefined)
+      }
+    })
   }
 
   private async renderAnimatedImageFrame(dataUri: string) {
@@ -1849,13 +2303,21 @@ export class InterludeService extends Service {
       if (!snapshot) return
 
       const userMessage = formatBufferedUserMessages(batch)
+      const turnQueryEmbedding = userMessage?.trim() && this.semanticTurnEmbeddingEnabled()
+        ? await this.embedText(userMessage.trim().slice(0, this.config.model.embedding?.maxInputCharacters ?? 4_000))
+        : undefined
       const quotedMessages: IndexedQuotedMessageContext[] = batch.flatMap((message, index) => message.quote
         ? [{ ...message.quote, messageIndex: index + 1 }]
         : [])
-      const stickerCatalog = this.stickerCatalogForSession(turn.latestSession)
+      const stickerCatalog = await this.stickerCatalogForSession(turn.latestSession, turnQueryEmbedding)
       const chatCapabilities = this.privateChatCapabilities(turn.latestSession)
       const imageSources = Array.from(new Set(batch.flatMap(message => message.imageSources))).slice(0, 3)
-      const images = await this.loadNativeImages(snapshot.story, imageSources, turn.latestSession)
+      const loadedImages = await this.loadNativeImages(snapshot.story, imageSources, turn.latestSession)
+      const visionMode = this.config.model.vision?.mode ?? 'native'
+      const visualObservations = visionMode === 'sidecar'
+        ? await this.describeCurrentImages(snapshot.story, loadedImages, userMessage)
+        : undefined
+      const images = visionMode === 'native' ? loadedImages : []
       // If another message arrived while an image was being downloaded, put
       // this batch back and let the newer revision compose one combined event.
       if (turn.nextRevision !== revision) {
@@ -1863,9 +2325,23 @@ export class InterludeService extends Service {
         return
       }
       const superseded = batch.flatMap(message => message.supersededIntents)
-      const { decision, succeeded, effectiveNow, immediateObservations } = await this.tryDecide(
-        snapshot.story, snapshot.participant, 'user-message', snapshot.from, snapshot.now, userMessage, snapshot.due, superseded, undefined, images, chatCapabilities, quotedMessages, stickerCatalog,
+      const early = { delivered: false, interaction: undefined as NarrativeInteraction | undefined }
+      const narrative = await this.tryDecide(
+        snapshot.story, snapshot.participant, 'user-message', snapshot.from, snapshot.now, userMessage, snapshot.due, superseded, undefined, images, chatCapabilities, quotedMessages, stickerCatalog, turnQueryEmbedding, visualObservations,
+        async reply => {
+          if (early.delivered) return false
+          const delivered = await this.deliverEarlyPrivateReply(snapshot.story, snapshot.participant, turn.latestSession, turn, requestId, reply)
+          if (delivered) {
+            early.delivered = true
+            early.interaction = reply.interaction
+          }
+          return delivered
+        },
       )
+      const { succeeded, effectiveNow, immediateObservations } = narrative
+      const decision = early.delivered && early.interaction
+        ? { ...narrative.decision, interaction: early.interaction }
+        : narrative.decision
 
       const result = await this.serial(turn.storyId, async () => {
         if (this.databaseResetting) return { obsolete: true, requeue: false, messages: [] as OutgoingMessageDraft[] }
@@ -1880,12 +2356,22 @@ export class InterludeService extends Service {
         // request has survived debounce invalidation. This keeps an obsolete
         // result from contaminating the next combined user turn.
         for (const observation of immediateObservations) await this.persistCollectedWebObservation(observation)
+        if (early.delivered && !succeeded) {
+          await this.appendEntry(current.id, {
+            kind: 'stream-finalization-failed', actor: 'system',
+            content: '主角首条消息已经提前投递，但流式叙事未能完成；本轮不会自动重发可见回复。',
+            occurredAt: now.toISOString(), metadata: { requestId },
+          }, now, currentParticipant.id)
+          await this.scheduleStreamScriptRecovery(current.id, currentParticipant.id, now)
+          this.reportOperation('standard', 'warn', current, 'user-message', '流式叙事在首条回复后未完成，已保留投递且停止自动重试 参与者=%s 请求=%d', currentParticipant.id, requestId)
+          return { obsolete: false, requeue: false, messages: [] as OutgoingMessageDraft[] }
+        }
         const commitsFirstReply = succeeded
           && decision.interaction?.reply?.mode === 'immediate'
           && typeof decision.interaction.reply.content === 'string'
           && !!decision.interaction.reply.content.trim()
         if (commitsFirstReply) turn.firstMessageCommittedRequestId = requestId
-        const messages = await this.persistDecision(current, currentParticipant, decision, snapshot.from, effectiveNow, true, 'user-message')
+        const messages = await this.persistDecision(current, currentParticipant, decision, snapshot.from, effectiveNow, true, 'user-message', [], early.delivered)
         if (succeeded) {
           await this.dbSet('interlude_story', { id: current.id }, { cursorAt: effectiveNow, updatedAt: now })
           if (snapshot.due.length) await this.dbSet('interlude_intent', { id: { $in: snapshot.due.map(intent => intent.id) } }, { status: 'completed', updatedAt: now })
@@ -1903,7 +2389,8 @@ export class InterludeService extends Service {
         return
       }
       if (this.canHandleParticipant(snapshot.participant)) {
-        await this.sendOutgoingMessages(snapshot.story, result.messages, snapshot.participant, turn.latestSession)
+        const delivered = await this.sendOutgoingMessages(snapshot.story, result.messages, snapshot.participant, turn.latestSession)
+        await this.confirmOutgoingDeliveries(snapshot.story, delivered)
         const sticker = this.resolveSticker(decision.localMedia, stickerCatalog)
         if (sticker && turn.latestSession) await this.sendSticker(snapshot.story, turn.latestSession, snapshot.participant.channelId, sticker)
         const nativeFace = sticker ? undefined : this.resolveNativeFace(decision, chatCapabilities)
@@ -1934,7 +2421,9 @@ export class InterludeService extends Service {
   /** Used by commands/tests to deliver a mixed set of account-targeted actions safely. */
   async deliverMessages(story: InterludeStory, messages: OutgoingMessageDraft[], session?: Session) {
     const participant = session ? await this.findParticipant(session, story) : undefined
-    await this.sendOutgoingMessages(story, messages, participant, session)
+    const delivered = await this.sendOutgoingMessages(story, messages, participant, session)
+    await this.confirmOutgoingDeliveries(story, delivered)
+    return delivered
   }
 
   async compactStory(story: InterludeStory, force = true) {
@@ -1992,8 +2481,8 @@ export class InterludeService extends Service {
       this.reportOperation('diagnostic', 'debug', story, 'advance', '后台扫描开始 游标=%s 下次自动推进=%s',
         formatLogTime(story.cursorAt, story.setting.timezone), formatLogTime(toDate(story.state.automation?.nextAdvanceAt), story.setting.timezone))
       const messages = await this.advanceStory(story, false)
-      if (messages.length) await this.sendScheduledMessages(story, messages)
-      this.reportOperation('diagnostic', 'debug', story, 'advance', '后台扫描完成 耗时=%dms 已投递=%d', Date.now() - startedAt, messages.length)
+      const delivered = messages.length ? await this.sendScheduledMessages(story, messages) : []
+      this.reportOperation('diagnostic', 'debug', story, 'advance', '后台扫描完成 耗时=%dms 已投递=%d', Date.now() - startedAt, delivered.length)
     } finally {
       this.sweepRunning = false
     }
@@ -2031,6 +2520,7 @@ export class InterludeService extends Service {
         undefined,
         undefined,
         target => this.interruptedTypingParticipants.has(target.id),
+        false,
       )
       if (!delivered.length) {
         if (this.interruptedTypingParticipants.has(participant.id)) continue
@@ -2105,10 +2595,10 @@ export class InterludeService extends Service {
         : 'advance'
       this.reportOperation('standard', 'info', story, phase,
         '即将执行自动写作 类型=%s 时间段=%s→%s', phaseLabel(phase), formatLogTime(from, story.setting.timezone), formatLogTime(now, story.setting.timezone))
-      const { decision, succeeded } = await this.tryDecide(story, followUpParticipant ?? null, phase, from, now, undefined, [])
+      const { decision, succeeded, timelinePlan } = await this.tryDecide(story, followUpParticipant ?? null, phase, from, now, undefined, [])
       if (succeeded) {
         const permitMessages = phase === 'conversation-follow-up' || this.config.runtime.allowProactiveMessages
-        messages.push(...await this.persistDecision(story, followUpParticipant ?? null, decision, from, now, permitMessages, phase))
+        messages.push(...await this.persistDecision(story, followUpParticipant ?? null, decision, from, now, permitMessages, phase, [], false, timelinePlan))
         await this.dbSet('interlude_story', { id: story.id }, { cursorAt: now, updatedAt: now })
         advanced = true
       }
@@ -2129,10 +2619,17 @@ export class InterludeService extends Service {
       const dueParticipant = dueParticipantId ? await this.getParticipant(dueParticipantId) : undefined
       this.reportOperation('standard', 'info', current, 'intent-due',
         '即将处理到期计划 数量=%d 类型=%s 参与者=%s', dueBatch.length, Array.from(new Set(dueBatch.map(intent => intent.type))).join(','), dueParticipant?.id || '全局')
-      const { decision, succeeded } = await this.tryDecide(current, dueParticipant ?? null, 'intent-due', dueFrom, now, undefined, dueBatch)
-      const permitMessages = this.config.runtime.allowProactiveMessages || dueBatch.some(intent => intent.payload?.userInitiated === true)
-      messages.push(...await this.persistDecision(current, dueParticipant ?? null, decision, dueFrom, now, permitMessages, 'intent-due', dueBatch))
-      if (succeeded) {
+      const { decision, succeeded, timelinePlan } = await this.tryDecide(current, dueParticipant ?? null, 'intent-due', dueFrom, now, undefined, dueBatch)
+      const streamRecovery = dueBatch.every(intent => intent.type === 'narrative-retry' && intent.payload?.streamRecovery === true)
+      const recovered = streamRecovery && succeeded
+        ? await this.persistStreamScriptRecovery(current, dueParticipant ?? null, decision, now)
+        : false
+      const turnSucceeded = streamRecovery ? recovered : succeeded
+      if (!streamRecovery) {
+        const permitMessages = this.config.runtime.allowProactiveMessages || dueBatch.some(intent => intent.payload?.userInitiated === true)
+        messages.push(...await this.persistDecision(current, dueParticipant ?? null, decision, dueFrom, now, permitMessages, 'intent-due', dueBatch, false, timelinePlan))
+      }
+      if (turnSucceeded) {
         await this.dbSet('interlude_story', { id: current.id }, { cursorAt: now, updatedAt: now })
         const ordinaryDueIds = dueBatch.filter(intent => intent.type !== 'follow-up-commitment').map(intent => intent.id)
         if (ordinaryDueIds.length) await this.dbSet('interlude_intent', { id: { $in: ordinaryDueIds } }, { status: 'completed', updatedAt: now })
@@ -2150,7 +2647,8 @@ export class InterludeService extends Service {
         if (retries.length) {
           const attempts = Math.max(...retries.map(intent => Number(intent.payload?.attempt) || 0))
           await this.dbSet('interlude_intent', { id: { $in: retries.map(intent => intent.id) } }, { status: 'cancelled', updatedAt: now })
-          await this.scheduleNarrativeRetry(current.id, dueParticipant?.id ?? '', now, attempts)
+          if (streamRecovery) await this.scheduleStreamScriptRecovery(current.id, dueParticipant?.id ?? '', now, attempts)
+          else await this.scheduleNarrativeRetry(current.id, dueParticipant?.id ?? '', now, attempts)
         }
         // Keep ordinary delayed plans pending until the provider recovers.
       }
@@ -2168,34 +2666,43 @@ export class InterludeService extends Service {
     return messages
   }
 
-  private async decide(story: InterludeStory, participant: InterludeParticipant | null, phase: NarrativeRequest['phase'], from: Date, now: Date, userMessage: string | undefined, dueIntents: NarrativeIntent[], supersededIntents: NarrativeIntent[] = [], groupContext?: GroupContext, images: NarrativeImage[] = [], extraWebContext: WebObservation[] = [], outputRecovery = false, chatCapabilities?: ChatActionCapabilities, quotedMessages: IndexedQuotedMessageContext[] = [], stickerCatalog: StickerCatalogEntry[] = []) {
+  private async decide(story: InterludeStory, participant: InterludeParticipant | null, phase: NarrativeRequest['phase'], from: Date, now: Date, userMessage: string | undefined, dueIntents: NarrativeIntent[], supersededIntents: NarrativeIntent[] = [], groupContext?: GroupContext, images: NarrativeImage[] = [], extraWebContext: WebObservation[] = [], outputRecovery = false, chatCapabilities?: ChatActionCapabilities, quotedMessages: IndexedQuotedMessageContext[] = [], stickerCatalog: StickerCatalogEntry[] = [], turnQueryEmbedding?: number[], visualObservations?: string[], timelinePlan?: TimelinePlan, onEarlyReply?: (reply: EarlyNarrativeReply) => Promise<boolean>) {
     // 这里是主模型上下文的唯一入口。recentEntries 保留近距离质感，场景、弧线和
     // facts 负责把很长的过去压缩成连续性线索。参与者摘要让模型知道角色
     // 同时还在与谁维系关系，而不是把每个 QQ 当成独立世界。
     // User and due-intent turns may arrive before the next background sweep.
     // Retire expired consequences here too, while keeping this a cheap local
     // database operation rather than a separate model request.
-    await this.expireActiveConsequences(story.id, now)
     const factQuery = createFactQuery(participant, userMessage, dueIntents, supersededIntents)
-    const [recentEntries, memories, scene, arc, facts, allParticipants, webContext, activeConsequences, overlaySnapshots, followUpCommitments] = await Promise.all([
+    const memoryEnabled = this.memoryConfig.enabled
+    // One turn-level query vector serves every semantic consumer (sticker
+    // filter, fact ranking, history recall); undefined when none needs it.
+    const resolvedTurnEmbedding = turnQueryEmbedding ?? (participant && userMessage?.trim() && this.semanticTurnEmbeddingEnabled()
+      ? await this.embedText(userMessage.trim().slice(0, this.config.model.embedding?.maxInputCharacters ?? 4_000))
+      : undefined)
+    const liveFactEmbedding = this.config.model.embedding?.liveQuery ? resolvedTurnEmbedding : undefined
+    const [recentEntries, memories, scene, arc, previousScenes, facts, allParticipants, webContext, activeConsequences, overlaySnapshots, followUpCommitments, scheduleRecord, upcomingIntents] = await Promise.all([
       // Use the runtime limits on the live path.  They are the options shown
       // to testers as “上下文条目/长期事实”，and should be authoritative.
-      this.recentEntries(story.id, this.config.runtime.contextEntryLimit),
-      this.memories(story.id, this.config.runtime.memoryLimit, participant?.id),
+      this.recentEntriesForPrompt(story.id, now),
+      memoryEnabled ? this.memories(story.id, this.config.runtime.memoryLimit, participant?.id) : Promise.resolve([]),
       this.activeScene(story.id),
       this.activeArc(story.id),
-      this.facts(story.id, this.config.runtime.memoryLimit, factQuery, participant?.id),
+      this.previousSceneSummaries(story.id),
+      memoryEnabled ? this.facts(story.id, this.config.runtime.memoryLimit, factQuery, participant?.id, liveFactEmbedding) : Promise.resolve([]),
       this.participants(story.id),
       this.webObservations(story.id, participant?.id),
-      this.activeConsequences(
+      this.activeConsequencesAndExpire(
         story.id,
         now,
         phase === 'advance' || this.sharedStoryConfig.shareParticipantDetails ? undefined : participant?.id,
       ),
-      this.overlaySnapshotsForPrompt(story.id, participant?.id, phase === 'advance'),
+      memoryEnabled ? this.overlaySnapshotsForPrompt(story.id, participant?.id, phase === 'advance') : Promise.resolve([]),
       participant && (phase === 'user-message' || phase === 'intent-due')
         ? this.pendingFollowUpCommitments(story.id, participant.id)
         : Promise.resolve([] as NarrativeIntent[]),
+      this.schedulePreplanConfig.enabled ? this.getSchedulePreplan(story.id) : Promise.resolve(undefined),
+      this.upcomingNarrativeIntents(story.id, now),
     ])
     const visibleEntries = this.sharedStoryConfig.shareParticipantDetails
       ? recentEntries
@@ -2213,7 +2720,9 @@ export class InterludeService extends Service {
       : visibleEntries
     // The turn's explicit event decides what is happening now. Historical
     // rows are context only and are never reinterpreted as a fresh message.
-    const promptEntries = turnEntries.filter(entry => !!entry.content.trim())
+    const promptEntries = turnEntries
+      .filter(entry => !!entry.content.trim())
+      .map(entry => timelineEntryPromptProjection(entry))
     const participants = allParticipants
       .filter(item => item.id !== participant?.id && this.canHandleParticipant(item))
       .sort((left, right) => participantRelevance(right) - participantRelevance(left))
@@ -2225,6 +2734,9 @@ export class InterludeService extends Service {
     const visibleDueIntents = this.sharedStoryConfig.shareParticipantDetails
       ? dueIntents
       : dueIntents.filter(intent => !intent.participantId || intent.participantId === participant?.id)
+    const visibleUpcomingIntents = phase === 'advance' || this.sharedStoryConfig.shareParticipantDetails
+      ? upcomingIntents
+      : upcomingIntents.filter(intent => !intent.participantId || intent.participantId === participant?.id)
     // A relationship consequence belongs to the protagonist's actual life.
     // Background writing therefore sees its compact effect even when raw
     // cross-participant chat history remains private. Live turns still see
@@ -2237,16 +2749,27 @@ export class InterludeService extends Service {
       .sort((left, right) => left.accessedAt.getTime() - right.accessedAt.getTime())
       .slice(-Math.max(1, this.browserConfig.maxObservationsInPrompt))
     const refreshContinuity = this.shouldRefreshContinuity(story, phase)
+    const userReportedTimes = phase === 'user-message' && userMessage?.trim()
+      ? extractUserReportedTimes(userMessage, now, story.setting.timezone)
+      : undefined
     return this.narrator.decide({
-      phase, refreshContinuity, outputRecovery, story, from, now, userMessage, images,
+      phase, refreshContinuity, outputRecovery, story, from, now, userMessage, userReportedTimes, images, visualObservations, timelinePlan,
       participant: phase === 'advance' ? null : participant,
       // A background turn may see relationship state through these opaque
       // participant summaries and may proactively contact one account only
       // when the owner explicitly enables proactive messages.
       participants: phase === 'advance' && !advanceCanContact ? [] : participants,
-      dueIntents: visibleDueIntents, activeConsequences: visibleConsequences, supersededIntents,
+      dueIntents: visibleDueIntents, upcomingIntents: visibleUpcomingIntents, activeConsequences: visibleConsequences, supersededIntents,
       shareParticipantDetails: this.sharedStoryConfig.shareParticipantDetails,
-      recentEntries: promptEntries, memories, sceneContext: { scene, arc }, facts, groupContext, chatCapabilities,
+      recentEntries: promptEntries, memories, sceneContext: { scene, arc, ...(previousScenes.length ? { previousScenes } : {}) }, facts, groupContext, chatCapabilities,
+      workingDetails: this.pruneWorkingDetails(normalizeStoryState(story.state).workingDetails, now),
+      timelineCarry: normalizeStoryState(story.state).timelineCarry,
+      recalledHistory: participant && userMessage?.trim() && resolvedTurnEmbedding?.length
+        ? await this.recallHistory(story.id, participant.id, resolvedTurnEmbedding, new Set(promptEntries.map(entry => entry.id)))
+        : undefined,
+      recentProtectionSince: (this.config.runtime.contextTimeWindowMinutes ?? 60) > 0
+        ? new Date(now.getTime() - Math.min(this.config.runtime.contextTimeWindowMinutes ?? 60, 1_440) * Time.minute)
+        : undefined,
       ...(quotedMessages.length ? { quotedMessages } : {}),
       ...(stickerCatalog.length && phase === 'user-message' ? { stickerCatalog } : {}),
       webContext: mergedWebContext, overlaySnapshots,
@@ -2258,6 +2781,8 @@ export class InterludeService extends Service {
         ? normalizeStoryState(story.state).automaticDeliverySummaries
         : [],
       followUpCommitments,
+      schedulePreplan: schedulePreplanWindow(scheduleRecord, now, story.setting.timezone, 12, this.schedulePreplanConfig),
+      onEarlyReply,
     })
   }
 
@@ -2265,20 +2790,64 @@ export class InterludeService extends Service {
    * successful narrative write. Ordinary turns reuse the last snapshot. */
   private shouldRefreshContinuity(story: InterludeStory, phase: NarrativeRequest['phase']) {
     const state = normalizeStoryState(story.state)
+    if (state.continuityDirty) return true
     if (phase === 'advance' && !state.continuitySnapshot) return true
     const count = Math.max(0, Math.floor(state.narrativeUpdateCount || 0))
     return (count + 1) % 15 === 0
   }
 
-  private async tryDecide(story: InterludeStory, participant: InterludeParticipant | null, phase: NarrativeRequest['phase'], from: Date, now: Date, userMessage: string | undefined, dueIntents: NarrativeIntent[], supersededIntents: NarrativeIntent[] = [], groupContext?: GroupContext, images: NarrativeImage[] = [], chatCapabilities?: ChatActionCapabilities, quotedMessages: IndexedQuotedMessageContext[] = [], stickerCatalog: StickerCatalogEntry[] = []) {
+  /** Automatic prose no longer invents the world timeline by itself. The
+   * compaction route first returns a tiny relative-time ledger; if it cannot,
+   * preserving the current cursor is safer than writing an ungrounded future. */
+  private async planAutomaticTimeline(story: InterludeStory, participant: InterludeParticipant | null, phase: Extract<NarrativeRequest['phase'], 'advance' | 'conversation-follow-up' | 'intent-due'>, from: Date, now: Date, dueIntents: NarrativeIntent[]) {
+    if (!this.compactor.planTimeline) return undefined
+    const [scene, recentEntries, facts, scheduleRecord] = await Promise.all([
+      this.activeScene(story.id),
+      this.recentEntriesForPrompt(story.id, now),
+      this.memoryConfig.enabled ? this.facts(story.id, Math.min(16, this.config.runtime.memoryLimit), '', participant?.id) : Promise.resolve([] as NarrativeFact[]),
+      this.schedulePreplanConfig.enabled ? this.getSchedulePreplan(story.id) : Promise.resolve(undefined),
+    ])
+    const visibleEntries = this.sharedStoryConfig.shareParticipantDetails
+      ? recentEntries
+      : recentEntries.filter(entry => !entry.participantId || entry.participantId === participant?.id)
+    const request: TimelinePlanRequest = {
+      story, participant, phase, from, now, scene, facts, recentEntries: visibleEntries.map(entry => timelineEntryPromptProjection(entry)),
+      dueIntents, schedulePreplan: schedulePreplanWindow(scheduleRecord, now, story.setting.timezone, 12, this.schedulePreplanConfig),
+    }
+    try {
+      const plan = normalizeTimelinePlan(await this.compactor.planTimeline(request))
+      if (plan) this.reportOperation('diagnostic', 'debug', story, phase, '时间导演已生成事件账本 节点=%d', plan.beats.length)
+      return plan
+    } catch (error) {
+      this.reportOperation('diagnostic', 'warn', story, phase, '时间导演调用失败 错误=%s', error)
+      return undefined
+    }
+  }
+
+  private async tryDecide(story: InterludeStory, participant: InterludeParticipant | null, phase: NarrativeRequest['phase'], from: Date, now: Date, userMessage: string | undefined, dueIntents: NarrativeIntent[], supersededIntents: NarrativeIntent[] = [], groupContext?: GroupContext, images: NarrativeImage[] = [], chatCapabilities?: ChatActionCapabilities, quotedMessages: IndexedQuotedMessageContext[] = [], stickerCatalog: StickerCatalogEntry[] = [], turnQueryEmbedding?: number[], visualObservations?: string[], onEarlyReply?: (reply: EarlyNarrativeReply) => Promise<boolean>) {
     let immediateObservations: WebObservation[] = []
     let effectiveNow = now
+    const automaticPhase = phase === 'advance' || phase === 'conversation-follow-up' || phase === 'intent-due'
+    const timelinePlan = automaticPhase
+      ? await this.planAutomaticTimeline(story, participant, phase, from, now, dueIntents)
+      : undefined
+    if (automaticPhase && !timelinePlan) {
+      this.reportOperation('standard', 'warn', story, phase, '时间导演未生成有效事件账本，已保留本次时间窗口等待下次重试')
+      return { decision: {}, succeeded: false, effectiveNow, immediateObservations, timelinePlan: undefined }
+    }
     const startedAt = Date.now()
     this.reportOperation('standard', 'info', story, phase,
       '模型调用开始 任务=主叙事 模型=%s 参与者=%s 时间段=%s→%s 到期计划=%d',
       this.mainModelLabel(), participant?.id || '全局', formatLogTime(from, story.setting.timezone), formatLogTime(now, story.setting.timezone), dueIntents.length)
     try {
-      let decision = await this.decide(story, participant, phase, from, effectiveNow, userMessage, dueIntents, supersededIntents, groupContext, images, [], false, chatCapabilities, quotedMessages, stickerCatalog)
+      let earlyReplyCommitted = false
+      const canEarlyReply = onEarlyReply && !(phase === 'user-message' && participant && !groupContext && this.browserConfig.enabled && this.browserConfig.mode === 'allow-immediate')
+      const earlyReply = canEarlyReply ? async (reply: EarlyNarrativeReply) => {
+        const committed = await onEarlyReply(reply)
+        if (committed) earlyReplyCommitted = true
+        return committed
+      } : undefined
+      let decision = await this.decide(story, participant, phase, from, effectiveNow, userMessage, dueIntents, supersededIntents, groupContext, images, [], false, chatCapabilities, quotedMessages, stickerCatalog, turnQueryEmbedding, visualObservations, timelinePlan, earlyReply)
       const immediate = phase === 'user-message' && participant && !groupContext && this.browserConfig.enabled && this.browserConfig.mode === 'allow-immediate'
         ? decision.browserIntents?.map(intent => normalizeBrowserIntentDraft(intent, this.browserConfig)).find(intent => intent?.timing === 'immediate')
         : undefined
@@ -2291,12 +2860,12 @@ export class InterludeService extends Service {
         const observation = await this.collectWebObservation(story, immediate, participant.id, null, new Date(), false)
         immediateObservations = [observation]
         effectiveNow = new Date()
-        decision = await this.decide(story, participant, phase, from, effectiveNow, userMessage, dueIntents, supersededIntents, groupContext, images, immediateObservations, false, chatCapabilities, quotedMessages, stickerCatalog)
+        decision = await this.decide(story, participant, phase, from, effectiveNow, userMessage, dueIntents, supersededIntents, groupContext, images, immediateObservations, false, chatCapabilities, quotedMessages, stickerCatalog, turnQueryEmbedding, visualObservations, timelinePlan)
       }
-      if (usesRemoteProviders(this.config.model) && requiresVisibleReplyRecovery(phase, groupContext, decision)) {
+      if (usesRemoteProviders(this.config.model) && !earlyReplyCommitted && requiresVisibleReplyRecovery(phase, groupContext, decision)) {
         this.reportOperation('standard', 'warn', story, phase,
           '结构化可见回复缺失，已抛弃本次未落库剧本并重新写作')
-        decision = await this.decide(story, participant, phase, from, effectiveNow, userMessage, dueIntents, supersededIntents, groupContext, images, immediateObservations, true, chatCapabilities, quotedMessages, stickerCatalog)
+        decision = await this.decide(story, participant, phase, from, effectiveNow, userMessage, dueIntents, supersededIntents, groupContext, images, immediateObservations, true, chatCapabilities, quotedMessages, stickerCatalog, turnQueryEmbedding, visualObservations, timelinePlan)
         if (requiresVisibleReplyRecovery(phase, groupContext, decision)) {
           throw new Error('Narrative provider omitted the required visible-reply structure after one recovery attempt.')
         }
@@ -2315,6 +2884,7 @@ export class InterludeService extends Service {
         succeeded: true,
         effectiveNow,
         immediateObservations,
+        timelinePlan,
       }
       if (this.config.logging?.logScriptPreview && result.decision.script) {
         this.report('info', story, phase, '当前剧本内容：\n%s', result.decision.script.slice(0, this.config.logging.previewLength))
@@ -2325,7 +2895,7 @@ export class InterludeService extends Service {
       return result
     } catch (error) {
       this.report('warn', story, phase, '模型调用失败 任务=主叙事 耗时=%dms 错误=%s', Date.now() - startedAt, error)
-      return { decision: {}, succeeded: false, effectiveNow, immediateObservations }
+      return { decision: {}, succeeded: false, effectiveNow, immediateObservations, timelinePlan }
     }
   }
 
@@ -2338,6 +2908,8 @@ export class InterludeService extends Service {
     permitMessages: boolean,
     phase: NarrativeRequest['phase'],
     contextIntents: NarrativeIntent[] = [],
+    immediateReplyAlreadyDelivered = false,
+    timelinePlan?: TimelinePlan,
   ) {
     // 先规范化，再写库：不信任模型给出的时间、长度和结构，尤其不能让未来剧情落库。
     const allParticipants = await this.participants(story.id)
@@ -2354,10 +2926,10 @@ export class InterludeService extends Service {
         actor: 'narrator',
         content: decision.script,
         occurredAt: now.toISOString(),
-        metadata: { phase, interaction: decision.interaction ?? null },
+        metadata: { phase, interaction: decision.interaction ?? null, ...(timelinePlan ? { timelinePlan } : {}) },
       }, now, participant?.id ?? '')
     }
-    await this.applyIntentUpdates(story.id, decision.intentUpdates, now, participant?.id)
+    const resolvedConsequences = await this.applyIntentUpdates(story.id, decision.intentUpdates, now, participant?.id)
     for (const memory of decision.memories) await this.appendMemory(story.id, memory, now, memory.participantId ?? participant?.id ?? '')
     for (const intent of decision.intents) {
       // A reminder or promise created while handling a user's message is a
@@ -2405,9 +2977,16 @@ export class InterludeService extends Service {
       if (decision.continuity) {
         nextState.continuitySnapshot = decision.continuity
         nextState.lastContinuityUpdateAt = now.toISOString()
+        nextState.continuityDirty = false
+      } else if (resolvedConsequences || resolvedFollowUps.size) {
+        nextState.continuityDirty = true
       }
       const alterTurn = this.updateAlterSystem(story, state.alterSystem, decision.alter, phase, now)
       nextState.alterSystem = alterTurn?.state ?? state.alterSystem
+      if (timelinePlan) {
+        nextState.timelineCarry = normalizeTimelineCarry(timelinePlan.carry)
+        await this.persistTimelineSceneAnchor(story.id, timelinePlan, now)
+      }
       if (this.agencyConfig.enabled && (phase === 'advance' || isAgencyCheck)) {
         const sourceEntries = decision.agencyWindow || decision.proactiveContact
           ? await this.recentEntries(story.id, Math.max(40, this.config.runtime.contextEntryLimit * 2))
@@ -2487,8 +3066,11 @@ export class InterludeService extends Service {
         }
       : undefined
     if (participant && !isAgencyCheck && interaction?.seen) await this.markParticipantSeen(participant, now)
-    if (participant && permitMessages && interaction?.reply.mode === 'immediate' && interaction.reply.content) {
-      messages.push({ participantId: participant.id, content: interaction.reply.content, automaticDelivery })
+    if (participant && permitMessages && !immediateReplyAlreadyDelivered && interaction?.reply.mode === 'immediate' && interaction.reply.content) {
+      messages.push({
+        participantId: participant.id, content: interaction.reply.content, automaticDelivery,
+        interaction: interaction ?? null, userInitiated: phase === 'user-message',
+      })
     }
     if (participant && permitMessages && interaction?.reply.mode === 'delayed' && interaction.reply.content && interaction.reply.sendAt) {
       const sendAt = new Date(interaction.reply.sendAt)
@@ -2519,25 +3101,27 @@ export class InterludeService extends Service {
       this.reportOperation('diagnostic', 'debug', story, phase,
         'Agency 拒绝未通过容量或来源验证的 crossConversationAction 数量=%d', decision.crossConversationActions.length)
     }
-    const acceptedAutomaticOutgoingActions = phase === 'advance'
+    const approvedAutomaticOutgoingActions = phase === 'advance'
       ? crossActions
         .filter(action => action.mode === 'immediate')
         .map(action => ({ participantId: action.participantId, mode: action.mode }))
       : []
-    // Keep a compact host-side receipt beside the life passage. It records
-    // only actions that passed the actual delivery gate, without parsing or
-    // rewriting the model's prose and without adding another model call.
-    if (scriptEntry && acceptedAutomaticOutgoingActions.length) {
+    // Keep a compact record of actions that passed the local policy gate. The
+    // actual visible receipt is written only after transport succeeds.
+    if (scriptEntry && approvedAutomaticOutgoingActions.length) {
       await this.dbSet('interlude_script_entry', { id: scriptEntry.id }, {
         metadata: {
           ...scriptEntry.metadata,
-          acceptedAutomaticOutgoingActions,
+          approvedAutomaticOutgoingActions,
         },
       })
     }
     for (const action of crossActions) {
       if (action.mode === 'immediate') {
-        messages.push({ participantId: action.participantId, content: action.content, automaticDelivery })
+        messages.push({
+          participantId: action.participantId, content: action.content, automaticDelivery,
+          interaction: interaction ?? null, userInitiated: phase === 'user-message',
+        })
       } else {
         const sendAtValue = (action as { sendAt?: string }).sendAt
         if (action.mode !== 'delayed' || !sendAtValue) continue
@@ -2551,51 +3135,64 @@ export class InterludeService extends Service {
     }
 
     for (const message of messages) {
-      // <sep/> bubbles are not all visible at the same instant. Persist the
-      // first one now; later bubbles become ordinary due intents so a new
-      // incoming message can cancel them before they are actually sent.
+      // A visible message is confirmed only after transport succeeds. Keep
+      // later bubbles in memory until that first bubble has actually arrived;
+      // otherwise a failed first send would leave fictional typing intents.
       const [first, ...later] = this.splitOutgoingMessage(message.content)
       if (!first) continue
       message.content = first
-      await this.appendEntry(story.id, {
-        kind: 'character-message', actor: 'character', content: first,
-        occurredAt: now.toISOString(), metadata: { visible: true, interaction: interaction ?? null },
-      }, now, message.participantId)
-      const target = allParticipants.find(item => item.id === message.participantId)
-      if (target) await this.recordCharacterMessage(target, now)
-      // The narrator may have spent tens of seconds generating before this
-      // decision reaches the transport layer.  Typing begins when the first
-      // bubble is actually committed, never from the earlier prompt time.
-      const typingStartedAt = new Date()
-      let delay = 0
-      for (const content of later) {
-        delay += this.typingDelayMilliseconds(content)
-        const sendAt = new Date(typingStartedAt.getTime() + delay)
-        await this.appendIntent(story.id, {
-          type: 'split-message',
-          summary: 'The character is still typing the next message segment.',
-          notBefore: sendAt.toISOString(),
-          payload: {
-            content, visibleMessage: true, userInitiated: phase === 'user-message',
-            ...(message.automaticDelivery ? { automaticDelivery: message.automaticDelivery } : {}),
-          },
-        }, typingStartedAt, message.participantId)
-        this.scheduleDueIntentWake(story.id, sendAt)
-      }
+      if (later.length) message.laterSegments = later
     }
     return messages
   }
 
+  /** Keep the active-scene anchor in sync with the host ledger immediately,
+   * rather than waiting for prose compaction to reconcile an already-completed
+   * automatic window. */
+  private async persistTimelineSceneAnchor(storyId: string, plan: TimelinePlan, now: Date) {
+    const scene = await this.activeScene(storyId)
+    const lastBeat = plan.beats[plan.beats.length - 1]
+    if (!scene || !lastBeat) return
+    const carry = normalizeTimelineCarry(plan.carry)
+    const summary = [
+      `Host timeline latest completed state: ${lastBeat.summary}`,
+      ...(carry.length ? [`Unresolved current state: ${carry.join(' | ')}`] : []),
+    ].join('\n')
+    await this.dbSet('interlude_scene', { id: scene.id }, {
+      hook: clip(lastBeat.summary, this.memoryConfig.sceneHookCharacters),
+      summary: clip(summary, this.memoryConfig.sceneSummaryCharacters),
+      updatedAt: now,
+    })
+  }
+
+  async adminSchedulePreplan(storyId: string) {
+    return this.getSchedulePreplan(storyId)
+  }
+
+  async requestSchedulePreplanRebuild(storyId: string) {
+    const current = await this.getSchedulePreplan(storyId)
+    if (!current) return false
+    await this.dbSet('interlude_schedule_preplan', { storyId }, {
+      lastReviewedLocalDate: '', validThrough: '1970-01-01', reviewReason: 'Administrator requested a rebuild.', updatedAt: new Date(),
+    })
+    this.scheduleCompaction(storyId)
+    return true
+  }
+
   private get alterSystemConfig(): AlterSystemConfig {
-    return resolveAlterSystemConfig(this.config.alterSystem)
+    return this.cachedAlterSystemConfig ??= resolveAlterSystemConfig(this.config.alterSystem)
   }
 
   private get agencyConfig(): AgencyConfig {
-    return resolveAgencyConfig(this.config.agency)
+    return this.cachedAgencyConfig ??= resolveAgencyConfig(this.config.agency)
+  }
+
+  private get schedulePreplanConfig(): SchedulePreplanConfig {
+    return this.cachedSchedulePreplanConfig ??= resolveSchedulePreplanConfig(this.config.schedulePreplan)
   }
 
   private get blindModeConfig(): BlindModeConfig {
-    return resolveBlindModeConfig(this.config.blindMode ?? this.config.blackBox)
+    return this.cachedBlindModeConfig ??= resolveBlindModeConfig(this.config.blindMode ?? this.config.blackBox)
   }
 
   private emotionalOffsetForPrompt(story: InterludeStory): EmotionalOffsetPrompt | null {
@@ -2705,29 +3302,54 @@ export class InterludeService extends Service {
    * signals instead of replacing them; a failed vector lookup simply has a
    * semantic score of zero for this turn.
    */
-  async facts(storyId: string, limit = this.memoryConfig.factLimit, query = '', participantId?: string) {
+  async facts(storyId: string, limit = this.memoryConfig.factLimit, query = '', participantId?: string, turnQueryEmbedding?: number[]) {
     // The previous floor of 50 caused every live turn to scan a large slice of
     // the facts table, even when the narrator only needed a handful of facts.
     // Keep enough candidates for semantic re-ranking without making the
     // latency-sensitive path do unnecessary database work.
     const candidateLimit = Math.max(20, Math.min(limit * 5, this.memoryConfig.maxFactsPerStory, 300))
-    const rows = await this.dbGet('interlude_fact', { storyId, status: 'active' }, {
-      limit: candidateLimit,
-      sort: { importance: 'desc', updatedAt: 'desc' },
-    })
+    const laneLimit = Math.max(1, Math.min(5, Math.floor(limit / 4) || 1))
+    const [rows, recentResolvedEvents, openPromises] = await Promise.all([
+      this.dbGet('interlude_fact', { storyId, status: 'active' }, {
+        limit: candidateLimit, sort: { importance: 'desc', updatedAt: 'desc' },
+      }),
+      this.dbGet('interlude_fact', { storyId, status: 'active', scope: 'event', unresolved: false }, {
+        limit: laneLimit * 2, sort: { updatedAt: 'desc' },
+      }),
+      this.dbGet('interlude_fact', { storyId, status: 'active', scope: 'promise', unresolved: true }, {
+        limit: laneLimit * 2, sort: { updatedAt: 'desc' },
+      }),
+    ])
     // Live embedding adds an extra HTTP request to every user turn. Keep it
     // opt-in; stored fact vectors and background backfill still work normally.
-    const queryEmbedding = query.trim() && this.config.model.embedding?.liveQuery
-      ? await this.embedText(query)
-      : []
-    return rows
-      .filter(fact => participantId === undefined || !fact.participantId || fact.participantId === participantId)
+    // A precomputed turn-level vector is preferred when the caller already
+    // built one, so multiple semantic consumers share a single request.
+    const queryEmbedding = turnQueryEmbedding?.length
+      ? turnQueryEmbedding
+      : query.trim() && this.config.model.embedding?.liveQuery
+        ? await this.embedText(query)
+        : []
+    const visible = (fact: NarrativeFact) => participantId === undefined || !fact.participantId || fact.participantId === participantId
+    const ranked = rows
+      .filter(visible)
       .map(fact => ({ fact, score: factScore(fact, this.memoryConfig, queryEmbedding) }))
       .sort((a, b) => b.score - a.score
         || b.fact.updatedAt.getTime() - a.fact.updatedAt.getTime()
         || b.fact.id - a.fact.id)
-      .slice(0, limit)
       .map(item => item.fact)
+    const selected: NarrativeFact[] = []
+    const seen = new Set<number>()
+    for (const fact of [
+      ...recentResolvedEvents.filter(visible).slice(0, laneLimit),
+      ...openPromises.filter(visible).slice(0, laneLimit),
+      ...ranked,
+    ]) {
+      if (seen.has(fact.id)) continue
+      seen.add(fact.id)
+      selected.push(fact)
+      if (selected.length >= limit) break
+    }
+    return selected
   }
 
   /** Returns only observations that are safe for this narration branch. A
@@ -2796,11 +3418,16 @@ export class InterludeService extends Service {
   /** Active consequences share the intent table but are never scheduler work.
    * Their payload keeps the lifecycle explicit so old scheduled intents keep
    * their existing behaviour without a migration. */
-  private async activeConsequences(storyId: string, now: Date, participantId?: string) {
+  private async activeConsequencesAndExpire(storyId: string, now: Date, participantId?: string) {
     if (!this.memoryConfig.activeConsequencesEnabled) return []
     const rows = await this.dbGet('interlude_intent', { storyId, status: 'pending' }, {
       limit: 100, sort: { updatedAt: 'desc' },
     })
+    const consequences = rows.filter(isActiveConsequence)
+    const expired = consequences.filter(intent => (consequenceExpiresAt(intent.payload)?.getTime() ?? 0) <= now.getTime())
+    if (expired.length) {
+      await this.dbSet('interlude_intent', { id: { $in: expired.map(intent => intent.id) } }, { status: 'completed', updatedAt: now })
+    }
     return rows
       .filter(isActiveConsequence)
       .filter(intent => intent.notBefore <= now)
@@ -2814,27 +3441,17 @@ export class InterludeService extends Service {
       .slice(0, Math.max(1, this.memoryConfig.activeConsequencePromptLimit))
   }
 
-  private async expireActiveConsequences(storyId: string, now: Date) {
-    if (!this.memoryConfig.activeConsequencesEnabled) return
-    const rows = await this.dbGet('interlude_intent', { storyId, status: 'pending' }, {
-      limit: 100, sort: { updatedAt: 'asc' },
-    })
-    const expired = rows.filter(intent => isActiveConsequence(intent) && (consequenceExpiresAt(intent.payload)?.getTime() ?? 0) <= now.getTime())
-    if (expired.length) {
-      await this.dbSet('interlude_intent', { id: { $in: expired.map(intent => intent.id) } }, { status: 'completed', updatedAt: now })
-    }
-  }
-
   /** Only active consequences visible to the writer may be resolved. This
    * prevents a remote model from changing arbitrary future plans by id. */
   private async applyIntentUpdates(storyId: string, updates: ReturnType<typeof normalizeIntentUpdates>, now: Date, participantId?: string) {
-    if (!updates.length) return
+    if (!updates.length) return false
     const ids = updates.map(update => update.id)
     const rows = await this.dbGet('interlude_intent', { storyId, id: { $in: ids }, status: 'pending' })
     const allowed = new Map(rows
       .filter(isActiveConsequence)
       .filter(intent => !participantId || !intent.participantId || intent.participantId === participantId)
       .map(intent => [intent.id, intent]))
+    let changed = false
     for (const update of updates) {
       const intent = allowed.get(update.id)
       if (!intent) continue
@@ -2843,7 +3460,9 @@ export class InterludeService extends Service {
         ...(update.resolution ? { resolution: update.resolution } : {}),
       }
       await this.dbSet('interlude_intent', { id: intent.id }, { status: update.status, payload, updatedAt: now })
+      changed = true
     }
+    return changed
   }
 
   /** Stores a narrator-proposed browser action as a future intent. The model
@@ -3046,6 +3665,14 @@ export class InterludeService extends Service {
     return intents.filter(intent => !expiredIds.has(intent.id) && !isActiveConsequence(intent))
   }
 
+  private async upcomingNarrativeIntents(storyId: string, now: Date) {
+    const rows = await this.dbGet('interlude_intent', {
+      storyId, status: 'pending', notBefore: { $gt: now },
+    }, { sort: { notBefore: 'asc' }, limit: 30 }) as NarrativeIntent[]
+    const internal = new Set(['split-message', 'browser-research', 'narrative-retry', 'proactive-check', 'active-consequence'])
+    return rows.filter(intent => !internal.has(intent.type)).slice(0, 8)
+  }
+
   /** Wake the scheduler close to a short typing delay instead of waiting for
    * the normal background sweep. The due intent remains the source of truth. */
   private scheduleDueIntentWake(storyId: string, notBefore: Date) {
@@ -3125,6 +3752,7 @@ export class InterludeService extends Service {
             undefined,
             undefined,
             target => this.interruptedTypingParticipants.has(target.id),
+            false,
           )
           if (!delivered.length) {
             if (this.interruptedTypingParticipants.has(participant.id)) return
@@ -3247,6 +3875,7 @@ export class InterludeService extends Service {
       if (resolvedIds.has(intent.id)) continue
       if (interaction?.reply.mode === 'immediate' && interaction.reply.content?.trim()) {
         await this.dbSet('interlude_intent', { id: intent.id }, { status: 'completed', updatedAt: now })
+        await this.markContinuityDirty(storyId, now)
         continue
       }
       const retryAt = new Date(now.getTime() + 20 * Time.minute)
@@ -3350,7 +3979,9 @@ export class InterludeService extends Service {
   }
 
   private async sendScheduledMessages(story: InterludeStory, messages: OutgoingMessageDraft[]) {
-    return this.sendOutgoingMessages(story, messages)
+    const delivered = await this.sendOutgoingMessages(story, messages)
+    await this.confirmOutgoingDeliveries(story, delivered)
+    return delivered
   }
 
   /**
@@ -3365,6 +3996,7 @@ export class InterludeService extends Service {
     current?: InterludeParticipant,
     session?: Session,
     shouldCancel?: (target: InterludeParticipant) => boolean,
+    recordFailures = true,
   ) {
     const delivered: OutgoingMessageDraft[] = []
     if (!messages.length) return delivered
@@ -3378,10 +4010,12 @@ export class InterludeService extends Service {
       const target = byId.get(message.participantId)
       if (!target) {
         this.report('warn', story, 'intent-due', '无法投递消息：参与者不存在 %s', message.participantId)
+        if (recordFailures) await this.recordOutgoingDeliveryFailure(story, message.participantId, message, 'participant-not-found')
         continue
       }
       if (!this.canHandleParticipant(target)) {
         this.report('warn', story, 'intent-due', '消息被当前账号白名单拦截 参与者=%s', target.id)
+        if (recordFailures) await this.recordOutgoingDeliveryFailure(story, target.id, message, 'participant-not-allowed')
         continue
       }
       if (shouldCancel?.(target)) {
@@ -3394,9 +4028,10 @@ export class InterludeService extends Service {
         const literalQuoteOnly = isLiteralQuoteOnly(message.content)
         if (literalQuoteOnly && !literalQuoteMessageId) {
           this.report('warn', story, 'intent-due', '已阻止无法映射的伪引用文本 参与者=%s', target.id)
+          if (recordFailures) await this.recordOutgoingDeliveryFailure(story, target.id, message, 'literal-quote-target-not-found')
           continue
         }
-        if (literalQuoteMessageId) await this.recordLiteralQuoteTransport(story.id, target.id, message.content, literalQuoteMessageId)
+        if (literalQuoteMessageId) message.quoteMessageId = literalQuoteMessageId
         const outgoingContent = literalQuoteMessageId
           ? [h('quote', { id: literalQuoteMessageId }), '\u200b']
           : message.content
@@ -3406,22 +4041,77 @@ export class InterludeService extends Service {
         if (session && current?.id === target.id) {
           await session.send(outgoingContent)
           delivered.push(message)
-          if (message.automaticDelivery) await this.recordAutomaticDelivery(story.id, target.id, message.automaticDelivery, new Date())
           continue
         }
         const bot = this.findBotForParticipant(target)
         if (!bot) {
           this.report('warn', story, 'intent-due', '没有可用机器人账号投递消息 参与者=%s', target.id)
+          if (recordFailures) await this.recordOutgoingDeliveryFailure(story, target.id, message, 'bot-not-found')
           continue
         }
         await bot.sendMessage(target.channelId, outgoingContent)
         delivered.push(message)
-        if (message.automaticDelivery) await this.recordAutomaticDelivery(story.id, target.id, message.automaticDelivery, new Date())
       } catch (error) {
-          this.report('warn', story, 'intent-due', '消息投递失败 参与者=%s 错误=%s', target.id, error)
+        this.report('warn', story, 'intent-due', '消息投递失败 参与者=%s 错误=%s', target.id, error)
+        if (recordFailures) await this.recordOutgoingDeliveryFailure(story, target.id, message, `transport-error: ${String(error)}`)
       }
     }
     return delivered
+  }
+
+  /** Confirm visible delivery only after the platform accepted the message.
+   * Failed attempts become explicit system evidence rather than fictional
+   * character speech, and deliberately do not auto-retry to avoid duplicates
+   * when an adapter fails after it has already accepted a request. */
+  private async confirmOutgoingDeliveries(story: InterludeStory, delivered: OutgoingMessageDraft[]) {
+    for (const message of delivered) {
+      await this.serial(story.id, async () => {
+        const participant = await this.getParticipant(message.participantId)
+        if (!participant) return
+        const now = new Date()
+        const content = message.quoteMessageId ? '[主角引用了此前的一条消息]' : message.content
+        await this.appendEntry(story.id, {
+          kind: 'character-message', actor: 'character', content,
+          occurredAt: now.toISOString(),
+          metadata: {
+            visible: true,
+            interaction: message.interaction ?? null,
+            ...(message.quoteMessageId ? { quoteMessageId: message.quoteMessageId, quoteTransport: true } : {}),
+          },
+        }, now, participant.id)
+        await this.recordCharacterMessage(participant, now)
+        if (message.automaticDelivery) await this.recordAutomaticDelivery(story.id, participant.id, message.automaticDelivery, now)
+        let delay = 0
+        for (const segment of message.laterSegments ?? []) {
+          delay += this.typingDelayMilliseconds(segment)
+          const sendAt = new Date(now.getTime() + delay)
+          await this.appendIntent(story.id, {
+            type: 'split-message', summary: 'The character is still typing the next message segment.',
+            notBefore: sendAt.toISOString(),
+            payload: {
+              content: segment, visibleMessage: true, userInitiated: message.userInitiated === true,
+              ...(message.automaticDelivery ? { automaticDelivery: message.automaticDelivery } : {}),
+            },
+          }, now, participant.id)
+          this.scheduleDueIntentWake(story.id, sendAt)
+        }
+      })
+    }
+  }
+
+  private async recordOutgoingDeliveryFailure(story: InterludeStory, participantId: string, message: OutgoingMessageDraft, reason: string) {
+    await this.serial(story.id, async () => {
+      const now = new Date()
+      await this.appendEntry(story.id, {
+        kind: 'outgoing-delivery-failed', actor: 'system',
+        content: `未投递的主角消息（仍未发送，不能视为用户已收到）：${clip(message.content, this.config.runtime.maxMessageCharacters)}`,
+        occurredAt: now.toISOString(),
+        metadata: {
+          status: 'pending', participantId, reason: clip(reason, 500),
+          ...(message.automaticDelivery ? { automaticDelivery: message.automaticDelivery } : {}),
+        },
+      }, now, participantId)
+    })
   }
 
   private async resolveLiteralQuoteMessageId(storyId: string, participantId: string, content: string) {
@@ -3432,18 +4122,6 @@ export class InterludeService extends Service {
     }) as ScriptEntry[]
     const matched = entries.find(entry => entry.content.trim() === quoted && targetableMessageId(entry.metadata?.messageId))
     return matched ? targetableMessageId(matched.metadata?.messageId) : undefined
-  }
-
-  private async recordLiteralQuoteTransport(storyId: string, participantId: string, content: string, messageId: string) {
-    const entries = await this.dbGet('interlude_script_entry', {
-      storyId, participantId, kind: 'character-message', content,
-    }, { limit: 3, sort: { createdAt: 'desc' } }) as ScriptEntry[]
-    const entry = entries[0]
-    if (!entry) return
-    await this.dbSet('interlude_script_entry', { id: entry.id }, {
-      content: '[主角引用了此前的一条消息]',
-      metadata: { ...entry.metadata, visible: true, quoteMessageId: messageId, quoteTransport: true },
-    })
   }
 
   /** Records only completed background deliveries. It is intentionally a
@@ -3483,8 +4161,10 @@ export class InterludeService extends Service {
     const baseSeconds = Math.max(0, this.config.runtime.typingBaseDelaySeconds ?? 1)
     const charactersPerSecond = Math.max(1, this.config.runtime.typingCharactersPerSecond ?? 8)
     const maximumSeconds = Math.max(baseSeconds, this.config.runtime.typingMaxDelaySeconds ?? 12)
-    const seconds = Math.min(maximumSeconds, baseSeconds + Math.ceil(nextSegment.length / charactersPerSecond))
-    return seconds * Time.second
+    const nominal = Math.min(maximumSeconds, baseSeconds + Math.ceil(nextSegment.length / charactersPerSecond))
+    const jitter = Math.max(0, Math.min(0.5, Number(this.config.runtime.typingJitterRatio ?? 0.3) || 0))
+    const factor = jitter ? 1 + (Math.random() * 2 - 1) * jitter : 1
+    return Math.max(250, Math.min(maximumSeconds * Time.second, Math.round(nominal * factor * Time.second)))
   }
 
   private findBotForParticipant(participant: InterludeParticipant) {
@@ -3494,8 +4174,9 @@ export class InterludeService extends Service {
   }
 
   private get autoAdvanceConfig(): AutoAdvanceConfig {
+    if (this.cachedAutoAdvanceConfig) return this.cachedAutoAdvanceConfig
     const runtime = this.config.runtime
-    return {
+    return this.cachedAutoAdvanceConfig = {
       enabled: runtime.autoAdvanceEnabled ?? true,
       intervalMinutes: Math.max(1, runtime.autoAdvanceIntervalMinutes ?? 40),
       jitterMinutes: Math.max(0, runtime.autoAdvanceJitterMinutes ?? 5),
@@ -3555,7 +4236,7 @@ export class InterludeService extends Service {
     // arrives. The new cadence is set after this turn has actually decided
     // whether it replies now, later, or not at all.
     const story = await this.getStory(storyId)
-    const fallbackNext = new Date(now.getTime() + automaticIntervalMinutes(story, now, this.autoAdvanceConfig) * Time.minute)
+    const fallbackNext = await this.schedulePreplanAnchoredTime(story, now, new Date(now.getTime() + automaticIntervalMinutes(story, now, this.autoAdvanceConfig) * Time.minute))
     const automation = {
       ...(story.state.automation ?? {}),
       conversationFollowUpAt: [],
@@ -3588,7 +4269,8 @@ export class InterludeService extends Service {
     const followUps = activeRestWindow(config.restWindows, story.setting.timezone, anchor)
       ? []
       : scheduleConversationFollowUps(anchor, config)
-    const normalNext = followUps.at(-1) ?? new Date(anchor.getTime() + automaticIntervalMinutes(story, anchor, config) * Time.minute)
+    const ordinaryNext = followUps.at(-1) ?? new Date(anchor.getTime() + automaticIntervalMinutes(story, anchor, config) * Time.minute)
+    const normalNext = followUps.length ? ordinaryNext : await this.schedulePreplanAnchoredTime(story, anchor, ordinaryNext)
     const automation = {
       ...(story.state.automation ?? {}),
       // Follow-ups are the only special post-conversation schedule. Regular
@@ -3610,7 +4292,8 @@ export class InterludeService extends Service {
     if (!config.enabled) return
     const story = await this.getStory(storyId)
     const intervalMinutes = automaticIntervalMinutes(story, now, config)
-    const nextAdvanceAt = new Date(now.getTime() + intervalMinutes * Time.minute)
+    const ordinaryNext = new Date(now.getTime() + intervalMinutes * Time.minute)
+    const nextAdvanceAt = await this.schedulePreplanAnchoredTime(story, now, ordinaryNext)
     const automation = {
       ...(story.state.automation ?? {}),
       quietUntil: undefined,
@@ -3620,12 +4303,20 @@ export class InterludeService extends Service {
       nextAdvanceAt: nextAdvanceAt.toISOString(),
     }
     await this.dbSet('interlude_story', { id: story.id }, { state: { ...story.state, automation }, updatedAt: now })
-    this.reportOperation('standard', 'info', story, 'advance', '已设置下次自动推进 时间=%s 间隔=%d分钟', formatLogTime(nextAdvanceAt, story.setting.timezone), intervalMinutes)
+    this.reportOperation('standard', 'info', story, 'advance', '已设置下次自动推进 时间=%s 间隔=%d分钟%s', formatLogTime(nextAdvanceAt, story.setting.timezone), Math.max(1, Math.round((nextAdvanceAt.getTime() - now.getTime()) / Time.minute)), nextAdvanceAt < ordinaryNext ? '（Schedule Preplan 锚点）' : '')
+  }
+
+  private async schedulePreplanAnchoredTime(story: InterludeStory, now: Date, ordinaryNext: Date) {
+    if (!this.schedulePreplanConfig.enabled || !this.schedulePreplanConfig.anchorAutoAdvance) return ordinaryNext
+    const schedule = await this.getSchedulePreplan(story.id)
+    const transition = nextSchedulePreplanTransition(schedule, now, story.setting.timezone, 12)
+    return transition && transition > now && transition < ordinaryNext ? transition : ordinaryNext
   }
 
   private get sharedStoryConfig(): SharedStoryConfig {
+    if (this.cachedSharedStoryConfig) return this.cachedSharedStoryConfig
     const { enabled: _legacyEnabled, ...overrides } = this.config.sharedStory ?? {}
-    return {
+    return this.cachedSharedStoryConfig = {
       // Beta2 deliberately keeps the single-story guard hard-enabled. Older
       // builds exposed a rollback switch here, but turning it off could create
       // fresh per-account stories that a later background sweep would revive.
@@ -3774,7 +4465,7 @@ export class InterludeService extends Service {
     const participant = await this.ensureParticipant(story, session, now)
     const tables = [
       'interlude_script_entry', 'interlude_memory', 'interlude_intent',
-      'interlude_scene', 'interlude_arc', 'interlude_fact', 'interlude_state_patch', 'interlude_overlay_snapshot', 'interlude_web_observation',
+      'interlude_scene', 'interlude_arc', 'interlude_fact', 'interlude_state_patch', 'interlude_overlay_snapshot', 'interlude_web_observation', 'interlude_schedule_preplan',
     ] as const
     for (const table of tables) await this.dbSet(table, { storyId: legacy.id }, { storyId: story.id } as any)
     // The old story only had one user, so account-bound records can safely be
@@ -3813,8 +4504,9 @@ export class InterludeService extends Service {
   }
 
   private get memoryConfig(): MemoryConfig {
+    if (this.cachedMemoryConfig) return this.cachedMemoryConfig
     // 保持 memory 为可选配置，方便从旧版本配置平滑升级；未填写时使用保守默认值。
-    return {
+    return this.cachedMemoryConfig = {
       enabled: true,
       backgroundIntervalMinutes: 10,
       maxStoriesPerCompactionRun: this.config.runtime.maxStoriesPerSweep,
@@ -3825,6 +4517,7 @@ export class InterludeService extends Service {
       sceneHookCharacters: 2_000,
       sceneSummaryCharacters: 8_000,
       arcSummaryCharacters: 12_000,
+      previousSceneSummaries: 2,
       recentEntryLimit: this.config.runtime.contextEntryLimit,
       factLimit: this.config.runtime.memoryLimit,
       factContentCharacters: 4_000,
@@ -3858,6 +4551,7 @@ export class InterludeService extends Service {
   }
 
   private get browserConfig(): BrowserConfig {
+    if (this.cachedBrowserConfig) return this.cachedBrowserConfig
     const merged: BrowserConfig = {
       enabled: false,
       mode: 'deferred-only',
@@ -3882,7 +4576,7 @@ export class InterludeService extends Service {
     // callers can still provide undefined/invalid numeric fields. Normalise
     // here so one malformed browser option cannot silently disable all due
     // research or break the page semaphore.
-    return {
+    return this.cachedBrowserConfig = {
       ...merged,
       maxConcurrentPages: Math.max(1, Math.min(4, Number(merged.maxConcurrentPages) || 1)),
       maxResearchPerSweep: Math.max(1, Math.min(20, Number(merged.maxResearchPerSweep) || 1)),
@@ -3921,7 +4615,7 @@ export class InterludeService extends Service {
   }
 
   private scheduleCompaction(storyId: string) {
-    if (!this.memoryConfig.enabled || this.scheduledCompactions.has(storyId)) return
+    if ((!this.memoryConfig.enabled && !this.schedulePreplanConfig.enabled) || this.scheduledCompactions.has(storyId)) return
     this.scheduledCompactions.add(storyId)
     this.reportStandaloneOperation('diagnostic', 'debug', '记忆整理已排队 故事=%s', storyId)
     const run = () => {
@@ -3936,33 +4630,247 @@ export class InterludeService extends Service {
         this.ctx.setTimeout(run, 500)
         return
       }
-      void this.serial(storyId, async () => {
-        if (this.hasPendingNarrative(storyId)) return
-        await this.compactUnlocked(await this.getStory(storyId), new Date(), false)
-      }).catch(error => this.reportStandaloneOperation('diagnostic', 'debug', '记忆压缩跳过 错误=%s', error))
+      void (async () => {
+        // Phase 1 (serial): cheap reads and due checks. The queue MUST be
+        // released before the compactor call — a promise-chain serial cannot
+        // be re-entered from inside one of its own running tasks (that
+        // deadlocks the whole story queue), so the expensive model call runs
+        // unqueued and only the cheap DB writes re-acquire it afterwards.
+        const prepared = await this.serial(storyId, async () => {
+          if (this.hasPendingNarrative(storyId)) return undefined
+          const story = await this.getStory(storyId)
+          const review = await this.prepareSchedulePreplanReview(story, new Date())
+          const context = await this.prepareCompaction(story, new Date(), false)
+          return { story, review, context }
+        })
+        if (!prepared || (!prepared.review?.needsModel && (!prepared.context || prepared.context.phase === 'skip'))) return
+        // Phase 2: the expensive model call, deliberately outside the queue.
+        const startedAt = Date.now()
+        const context = prepared.context?.phase === 'run' ? prepared.context : undefined
+        this.reportOperation('standard', 'info', prepared.story, 'advance', '后台整理开始 条目=%d 字符=%d 场景压缩=%s SchedulePreplan=%s', context?.sceneEntries.length ?? 0, context?.chars ?? 0, context?.sceneCompactionDue ?? false, !!prepared.review?.needsModel)
+        let scheduleProposal: unknown = undefined
+        if (prepared.review?.needsModel && prepared.review.request) {
+          scheduleProposal = await this.requestSchedulePreplan(prepared.story, prepared.review.request)
+        }
+        let decision: CompactionDecision = {}
+        if (context) {
+          try {
+            decision = await this.compactor.compact(context.compactRequest)
+          } catch (error) {
+            this.report('warn', context.current, 'advance', '记忆压缩失败：%s', error)
+            return
+          }
+        }
+        // Phase 3 (serial): cheap DB writes, re-queued after the model call.
+        await this.serial(storyId, async () => {
+          if (this.databaseResetting) return
+          if (prepared.review?.needsModel) {
+            const persisted = await this.persistSchedulePreplanReview(prepared.story, prepared.review, scheduleProposal, new Date())
+            if (persisted) this.schedulePreplanBackoff.delete(storyId)
+            else this.schedulePreplanBackoff.set(storyId, Date.now() + SCHEDULE_PREPLAN_RETRY_BACKOFF)
+          }
+          if (context) await this.applyCompaction(context.current, context, decision, new Date(), startedAt)
+        })
+      })()
+        .catch(error => this.reportStandaloneOperation('diagnostic', 'debug', '记忆压缩跳过 错误=%s', error))
         .finally(() => this.scheduledCompactions.delete(storyId))
     }
     run()
   }
 
   private async compactStories() {
-    if (!this.memoryConfig.enabled || this.compactionSweepRunning) return
+    if ((!this.memoryConfig.enabled && !this.schedulePreplanConfig.enabled) || this.compactionSweepRunning) return
     this.compactionSweepRunning = true
     try {
       const story = await this.getCanonicalStory()
       if (!story || !this.canHandleStory(story)) return
-      this.scheduleFactEmbeddingBackfill(story.id)
+      if (this.memoryConfig.enabled) this.scheduleFactEmbeddingBackfill(story.id)
+      if (this.config.model.embedding?.semanticHistory) {
+        void this.backfillHistoryEmbeddings(story.id)
+          .catch(error => this.reportStandaloneOperation('diagnostic', 'debug', '历史向量补齐跳过 错误=%s', error))
+      }
       this.scheduleCompaction(story.id)
     } finally {
       this.compactionSweepRunning = false
     }
   }
 
+  private async getSchedulePreplan(storyId: string) {
+    const row = (await this.dbGet('interlude_schedule_preplan', { storyId }))[0]
+    return normalizeSchedulePreplanRecord(row)
+  }
+
+  private async schedulePreplanEvidence(storyId: string, afterEntryId: number) {
+    const filter: any = { storyId, kind: 'script' }
+    if (afterEntryId > 0) filter.id = { $gt: afterEntryId }
+    const entries = await this.dbGet('interlude_script_entry', filter, { sort: { occurredAt: 'asc' }, limit: 60 }) as ScriptEntry[]
+    if (this.sharedStoryConfig.shareParticipantDetails) return entries
+    // A recurring schedule belongs to the protagonist, but raw private prose
+    // must not be sent to the background schedule model. Automatic scripts
+    // already carry a host-validated timelinePlan: project that safe ledger
+    // instead of dropping every participant-owned life event.
+    return entries.flatMap(entry => {
+      if (!entry.participantId) return [entry]
+      const projected = timelineEntryPromptProjection(entry)
+      return projected === entry ? [] : [{ ...projected, participantId: '' }]
+    })
+  }
+
+  private async saveSchedulePreplan(record: SchedulePreplanRecord) {
+    const existing = (await this.dbGet('interlude_schedule_preplan', { storyId: record.storyId }))[0]
+    if (existing) await this.dbSet('interlude_schedule_preplan', { storyId: record.storyId }, record)
+    else await this.dbCreate('interlude_schedule_preplan', record)
+  }
+
+  private async prepareSchedulePreplanReview(story: InterludeStory, now: Date) {
+    const config = this.schedulePreplanConfig
+    if (!config.enabled) return undefined
+    const backoffUntil = this.schedulePreplanBackoff.get(story.id)
+    if (backoffUntil && now.getTime() < backoffUntil) return undefined
+    const current = await this.getSchedulePreplan(story.id)
+    if (!schedulePreplanReviewDue(current, now, story.setting.timezone, config)) return undefined
+    const localDate = calendarDayKey(now, story.setting.timezone)
+    const evidenceEntries = await this.schedulePreplanEvidence(story.id, current?.lastEvidenceEntryId ?? 0)
+    if (!current && !evidenceEntries.length) {
+      const empty = applySchedulePreplanProposal(
+        undefined,
+        { outcome: 'replace', reason: 'No concrete recurring schedule evidence yet.', regimes: [], exceptions: [] },
+        [], localDate, story.setting.timezone, config, now, config.variationLevel,
+      )
+      if (empty) {
+        empty.storyId = story.id
+        await this.saveSchedulePreplan(empty)
+        this.reportOperation('diagnostic', 'debug', story, 'advance', 'Schedule Preplan 已建立空记录：等待可验证的生活日程证据')
+        return { current: empty, evidenceEntries, localDate, needsModel: false, request: undefined }
+      }
+    }
+    const needsModel = schedulePreplanNeedsModel(current, evidenceEntries, localDate, story.setting.timezone, config)
+    if (!needsModel && current) {
+      await this.saveSchedulePreplan(refreshSchedulePreplan(current, localDate, story.setting.timezone, config, now))
+      this.reportOperation('diagnostic', 'debug', story, 'advance', 'Schedule Preplan 今日检查完成：没有新证据，日程保持不变')
+    }
+    const request: SchedulePreplanReviewRequest | undefined = needsModel ? {
+      localDate, horizonDays: config.horizonDays, variationLevel: config.variationLevel, current: current ?? null, evidenceEntries,
+    } : undefined
+    return { current, evidenceEntries, localDate, needsModel, request }
+  }
+
+  /** Preplan has one small independent request instead of competing with
+   * scene/fact compression. One recovery retry is cheap and covers providers
+   * that occasionally omit an otherwise valid JSON object. */
+  private async requestSchedulePreplan(story: InterludeStory, request: SchedulePreplanReviewRequest) {
+    if (!this.compactor.planSchedulePreplan) return undefined
+    let proposal = await this.compactor.planSchedulePreplan(request)
+    if (proposal) return proposal
+    this.reportOperation('diagnostic', 'warn', story, 'advance', 'Schedule Preplan 返回为空，正在进行一次轻量恢复重试')
+    proposal = await this.compactor.planSchedulePreplan(request)
+    return proposal
+  }
+
+  private async persistSchedulePreplanReview(
+    story: InterludeStory,
+    review: { current?: SchedulePreplanRecord; evidenceEntries: ScriptEntry[]; localDate: string },
+    proposal: unknown,
+    now: Date,
+  ) {
+    const next = applySchedulePreplanProposal(
+      review.current, proposal, review.evidenceEntries, review.localDate,
+      story.setting.timezone, this.schedulePreplanConfig, now, this.schedulePreplanConfig.variationLevel,
+    )
+    if (!next) {
+      // A narrow review can still fail on an unstable provider. On first use,
+      // persist an explicit empty review with the inspected evidence cursor:
+      // this is truthful, prevents a full retry loop, and new evidence will
+      // naturally make the next review due again.
+      if (!review.current) {
+        const empty = applySchedulePreplanProposal(
+          undefined,
+          { outcome: 'replace', reason: 'Schedule review returned no valid structure; waiting for new concrete evidence.', regimes: [], exceptions: [] },
+          review.evidenceEntries, review.localDate, story.setting.timezone, this.schedulePreplanConfig, now, this.schedulePreplanConfig.variationLevel,
+        )
+        if (empty) {
+          empty.storyId = story.id
+          await this.saveSchedulePreplan(empty)
+          this.reportOperation('standard', 'warn', story, 'advance', 'Schedule Preplan 未形成有效日程，已保存空审查记录并等待新证据')
+          return true
+        }
+      }
+      this.reportOperation('standard', 'warn', story, 'advance', 'Schedule Preplan 未更新：模型没有返回可用日程，保留现有版本')
+      return false
+    }
+    next.storyId = story.id
+    await this.saveSchedulePreplan(next)
+    this.reportOperation('standard', 'info', story, 'advance', 'Schedule Preplan 已审查 版本=%d 覆盖=%s→%s 原因=%s', next.revision, next.validFrom, next.validThrough, next.reviewReason)
+    return true
+  }
+
+  /** A visible reply already reached the user, so this retry may write only
+   * the missing life script. It must never create a second transport message. */
+  private async scheduleStreamScriptRecovery(storyId: string, participantId: string, now: Date, previousAttempts = 0) {
+    const delaySeconds = Math.max(5, this.config.runtime.narrativeRetryDelaySeconds ?? 60)
+    const maxAttempts = Math.min(2, Math.max(0, this.config.runtime.narrativeRetryMaxAttempts ?? 6))
+    if (!participantId || previousAttempts >= maxAttempts) return false
+    const pending = await this.dbGet('interlude_intent', { storyId, participantId, status: 'pending', type: 'narrative-retry' }) as NarrativeIntent[]
+    const existing = pending.filter(intent => intent.payload?.streamRecovery === true)
+    if (existing.length) await this.dbSet('interlude_intent', { id: { $in: existing.map(intent => intent.id) } }, { status: 'cancelled', updatedAt: now })
+    const attempt = previousAttempts + 1
+    const notBefore = new Date(now.getTime() + delaySeconds * Time.second)
+    await this.appendIntent(storyId, {
+      type: 'narrative-retry', summary: `Recover only the missing script after a streamed reply (attempt ${attempt}/${maxAttempts}).`,
+      notBefore: notBefore.toISOString(), payload: { narrativeRetry: true, streamRecovery: true, userInitiated: true, attempt },
+    }, now, participantId)
+    this.scheduleDueIntentWake(storyId, notBefore)
+    return true
+  }
+
+  private async persistStreamScriptRecovery(story: InterludeStory, participant: InterludeParticipant | null, decision: NarrativeDecision, now: Date) {
+    const script = decision.script?.trim()
+    if (!script) return false
+    await this.appendEntry(story.id, {
+      kind: 'script', actor: 'narrator', content: script, occurredAt: now.toISOString(),
+      metadata: { phase: 'stream-script-recovery', interaction: null },
+    }, now, participant?.id ?? '')
+    const state = normalizeStoryState(story.state)
+    const nextState: StoryState = { ...state, narrativeUpdateCount: state.narrativeUpdateCount + 1 }
+    if (decision.continuity) {
+      nextState.continuitySnapshot = decision.continuity
+      nextState.lastContinuityUpdateAt = now.toISOString()
+      nextState.continuityDirty = false
+    }
+    await this.dbSet('interlude_story', { id: story.id }, { state: nextState, updatedAt: now })
+    return true
+  }
+
   private async compactUnlocked(story: InterludeStory, now: Date, force: boolean) {
+    const review = await this.prepareSchedulePreplanReview(story, now)
+    const context = await this.prepareCompaction(story, now, force)
+    if (review?.needsModel && review.request) {
+      const proposal = await this.requestSchedulePreplan(story, review.request)
+      const persisted = await this.persistSchedulePreplanReview(story, review, proposal, new Date())
+      if (persisted) this.schedulePreplanBackoff.delete(story.id)
+      else this.schedulePreplanBackoff.set(story.id, Date.now() + SCHEDULE_PREPLAN_RETRY_BACKOFF)
+    }
+    if (!context || context.phase === 'skip') return context?.overlayCompacted ?? false
+    const startedAt = Date.now()
+    this.reportOperation('standard', 'info', story, 'advance', '后台整理开始 条目=%d 字符=%d 场景压缩=%s SchedulePreplan=%s', context.sceneEntries.length, context.chars, context.sceneCompactionDue, !!review?.needsModel)
+    let decision: CompactionDecision = {}
+    try {
+      decision = await this.compactor.compact(context.compactRequest)
+    } catch (error) {
+      this.report('warn', story, 'advance', '记忆压缩失败：%s', error)
+      return false
+    }
+    return this.applyCompaction(story, context, decision, now, startedAt)
+  }
+
+  /** Everything up to the expensive compactor call: cheap reads plus the due
+   * checks. Runs inside the story serial queue, but the model call itself must
+   * not — a queued compactor request would delay the next live turn. */
+  private async prepareCompaction(story: InterludeStory, now: Date, force: boolean): Promise<PreparedCompaction | undefined> {
     await this.ensureContinuity(story, now)
-    const overlayCompacted = await this.compactOverlayUnlocked(story, now)
+    const overlayCompacted = this.memoryConfig.enabled ? await this.compactOverlayUnlocked(story, now) : false
     const scene = await this.activeScene(story.id)
-    if (!scene) return overlayCompacted
+    if (!scene) return { phase: 'skip', overlayCompacted }
     // lastEntryId 将场景摘要变成增量检查点：已经压缩过的原文不再重复传给模型。
     const entryFilter: any = { storyId: story.id, occurredAt: { $gte: scene.startedAt } }
     if (scene.lastEntryId != null) entryFilter.id = { $gt: scene.lastEntryId }
@@ -3972,10 +4880,10 @@ export class InterludeService extends Service {
     })
     const sceneEntries = limitEntriesByCharacters(entries, this.memoryConfig.compactionCharacterLimit)
     const chars = sceneEntries.reduce((sum, entry) => sum + entry.content.length, 0)
-    // 任一阈值达到即可压缩；手动命令可以 force，用于调试或故事阶段转换。
-    if (!force && sceneEntries.length < this.memoryConfig.sceneEntryThreshold && chars < this.memoryConfig.sceneCharacterThreshold) {
+    const sceneCompactionDue = this.memoryConfig.enabled && (force || sceneEntries.length >= this.memoryConfig.sceneEntryThreshold || chars >= this.memoryConfig.sceneCharacterThreshold)
+    if (!sceneCompactionDue) {
       this.reportOperation('diagnostic', 'debug', story, 'advance', '记忆整理跳过：未达到阈值 条目=%d/%d 字符=%d/%d', sceneEntries.length, this.memoryConfig.sceneEntryThreshold, chars, this.memoryConfig.sceneCharacterThreshold)
-      return overlayCompacted
+      return { phase: 'skip', overlayCompacted }
     }
     const current = await this.getStory(story.id)
     const participants = await this.participants(story.id)
@@ -3985,24 +4893,27 @@ export class InterludeService extends Service {
         ? { ...entry, participantId: '', content: '[participant-specific conversation omitted by privacy setting]' }
         : entry))
       .filter(entry => !!entry.content.trim())
-    const visibleCompactionFacts = this.sharedStoryConfig.shareParticipantDetails
+    const visibleCompactionFacts = this.memoryConfig.enabled && this.sharedStoryConfig.shareParticipantDetails
       ? await this.facts(story.id, this.memoryConfig.maxFactsPerStory)
-      : (await this.facts(story.id, this.memoryConfig.maxFactsPerStory)).filter(fact => !fact.participantId)
-    let decision: CompactionDecision = {}
-    const startedAt = Date.now()
-    this.reportOperation('standard', 'info', story, 'advance', '记忆整理开始 条目=%d 字符=%d 强制=%s', sceneEntries.length, chars, force)
-    try {
-      decision = await this.compactor.compact({
+      : this.memoryConfig.enabled ? (await this.facts(story.id, this.memoryConfig.maxFactsPerStory)).filter(fact => !fact.participantId) : []
+    return {
+      phase: 'run', overlayCompacted, scene, sceneEntries, chars, sceneCompactionDue, current, participants,
+      visibleCompactionEntries, visibleCompactionFacts,
+      compactRequest: {
         story: current, from: scene.startedAt, now, entries: visibleCompactionEntries,
         scene, arc: await this.activeArc(story.id), participants,
         facts: visibleCompactionFacts,
-      })
-    } catch (error) {
-      this.report('warn', story, 'advance', '记忆压缩失败：%s', error)
-      return false
+      },
     }
-    await this.persistCompaction(current, scene, decision, sceneEntries, now)
-    this.reportOperation('standard', 'info', story, 'advance', '记忆整理完成 耗时=%dms 剧本条目=%d 长期事实=%d 状态变更=%d', Date.now() - startedAt, sceneEntries.length, decision.facts?.length ?? 0, decision.statePatches?.length ?? 0)
+  }
+
+  /** Cheap DB persistence for one compaction decision. Re-acquires the story
+   * serial queue in the caller so writes stay ordered with narrative turns. */
+  private async applyCompaction(story: InterludeStory, context: PreparedCompactionRun, decision: CompactionDecision, now: Date, startedAt: number) {
+    if (context.sceneCompactionDue) {
+      await this.persistCompaction(context.current, context.scene, decision, context.sceneEntries, now, new Set(context.visibleCompactionFacts.map(fact => fact.id)))
+    }
+    this.reportOperation('standard', 'info', story, 'advance', '后台整理完成 耗时=%dms 剧本条目=%d 长期事实=%d 状态变更=%d', Date.now() - startedAt, context.sceneCompactionDue ? context.sceneEntries.length : 0, context.sceneCompactionDue ? decision.facts?.length ?? 0 : 0, context.sceneCompactionDue ? decision.statePatches?.length ?? 0 : 0)
     return true
   }
 
@@ -4128,7 +5039,7 @@ export class InterludeService extends Service {
     }
   }
 
-  private async persistCompaction(story: InterludeStory, scene: InterludeScene, decision: CompactionDecision, entries: ScriptEntry[], now: Date) {
+  private async persistCompaction(story: InterludeStory, scene: InterludeScene, decision: CompactionDecision, entries: ScriptEntry[], now: Date, visibleFactIds = new Set<number>()) {
     // 摘要更新成功后才移动 lastEntryId，确保失败时原始条目仍会在下次被重新处理。
     const scenePatch = decision.scene ?? {}
     await this.dbSet('interlude_scene', { id: scene.id }, {
@@ -4150,25 +5061,47 @@ export class InterludeService extends Service {
         state: { ...state, scenePresence: [...byName.values()].slice(-8) }, updatedAt: now,
       })
     }
+    if (decision.workingDetails?.length) {
+      const current = await this.getStory(story.id)
+      const state = normalizeStoryState(current.state)
+      const merged = new Map<string, WorkingDetail>()
+      for (const item of state.workingDetails ?? []) merged.set(item.label, item)
+      for (const draft of decision.workingDetails) {
+        if (!hasCompactionEvidence(draft.sourceEntryIds ?? [], entries)) continue
+        const label = clip(draft.label, 80).trim()
+        const value = clip(draft.value, 300).trim()
+        if (!label || !value) continue
+        const expiresAt = draft.expiresAt && !Number.isNaN(new Date(draft.expiresAt).getTime()) ? draft.expiresAt : undefined
+        const sourceEntryIds = (draft.sourceEntryIds ?? []).filter(id => entries.some(entry => entry.id === id)).slice(0, 8)
+        merged.set(label, { label, value, ...(expiresAt ? { expiresAt } : {}), createdAt: now.toISOString(), ...(sourceEntryIds.length ? { sourceEntryIds } : {}) })
+      }
+      const live = [...merged.values()].filter(item => !item.expiresAt || new Date(item.expiresAt) > now).slice(-10)
+      await this.dbSet('interlude_story', { id: current.id }, { state: { ...state, workingDetails: live }, updatedAt: now })
+    }
     const arc = await this.activeArc(story.id)
     if (arc && decision.arc) {
       await this.dbSet('interlude_arc', { id: arc.id }, {
         title: clip(decision.arc.title ?? arc.title, 255), summary: clip(decision.arc.summary ?? arc.summary, this.memoryConfig.arcSummaryCharacters), updatedAt: now,
       })
     }
+    let resolvedFacts = false
     for (const fact of decision.facts ?? []) {
       if (!hasCompactionEvidence(fact.sourceEntryIds, entries)) continue
-      await this.persistFact(story.id, fact, entries, now)
+      const resolved = await this.resolveCompactionFacts(story.id, fact.resolvesFactIds, visibleFactIds, now)
+      resolvedFacts ||= resolved
+      const mergedResolution = await this.persistFact(story.id, fact, entries, now)
+      resolvedFacts ||= mergedResolution
     }
     for (const patch of decision.statePatches ?? []) {
       if (!hasCompactionEvidence(patch.sourceEntryIds, entries)) continue
       await this.persistStatePatch(story, patch, entries, now)
     }
+    if (resolvedFacts) await this.markContinuityDirty(story.id, now)
   }
 
   private async persistFact(storyId: string, draft: { scope: NarrativeFact['scope']; content: string; participantId?: string; importance?: number; confidence?: number; unresolved?: boolean; sourceEntryIds?: number[] }, entries: ScriptEntry[], now: Date) {
     const content = clip(draft.content, this.memoryConfig.factContentCharacters)
-    if (!content) return
+    if (!content) return false
     const participantId = resolveParticipantId(draft.participantId, draft.sourceEntryIds, entries)
     const existing = await this.dbGet('interlude_fact', { storyId, status: 'active' })
     // 当前先做完全规范化匹配的去重；更复杂的语义去重可在检索层升级时替换。
@@ -4178,15 +5111,16 @@ export class InterludeService extends Service {
     // says that the promise has already been fulfilled or closed.
     const unresolved = draft.unresolved === true || (draft.unresolved === undefined && draft.scope === 'promise')
     if (same) {
+      const resolved = same.unresolved && draft.unresolved === false
       const embedding = same.embedding?.length ? same.embedding : await this.embedText(content)
       await this.dbSet('interlude_fact', { id: same.id }, {
         importance: Math.max(same.importance, clampNumber(draft.importance, same.importance, 0, 1)),
         confidence: Math.max(same.confidence, clampNumber(draft.confidence, same.confidence, 0, 1)),
-        unresolved: same.unresolved || unresolved,
+        unresolved: draft.unresolved === false ? false : same.unresolved || unresolved,
         ...(embedding.length ? { embedding } : {}),
         sourceEntryIds: Array.from(new Set([...same.sourceEntryIds, ...sourceEntryIds])), lastSeenAt: now, updatedAt: now,
       })
-      return
+      return resolved
     }
     if (existing.length >= this.memoryConfig.maxFactsPerStory) {
       const oldest = existing.sort((a, b) => (a.importance * a.confidence) - (b.importance * b.confidence))[0]
@@ -4198,6 +5132,7 @@ export class InterludeService extends Service {
       embedding: await this.embedText(content), status: 'active', sourceEntryIds,
       lastSeenAt: now, createdAt: now, updatedAt: now,
     })
+    return false
   }
 
   private async embedText(value: string) {
@@ -4356,6 +5291,14 @@ export class InterludeService extends Service {
     this.writeStandalone(level, message, args)
   }
 
+  /** One Koishi log line per model call: token counts, cache hit rate and
+   * optional billing from the per-connection price fields. */
+  private reportTokenUsage(record: TokenUsageRecord) {
+    const line = formatTokenUsageLine(record)
+    if (!line) return
+    this.reportStandalone('info', `Token 用量[${record.task}] 模型=${record.model} ${line}`)
+  }
+
   private reportStandaloneOperation(verbosity: 'summary' | 'standard' | 'diagnostic', level: 'error' | 'warn' | 'info' | 'debug', message: string, ...args: unknown[]) {
     if (!this.allowsVerbosity(verbosity)) return
     this.writeStandalone(level, message, args)
@@ -4376,6 +5319,25 @@ export class InterludeService extends Service {
       })
       : `[系统] ${renderLogMessage(message, args)}`
     this.emitLog(level, output)
+  }
+
+  private async resolveCompactionFacts(storyId: string, value: unknown, allowedIds: ReadonlySet<number>, now: Date) {
+    const ids = Array.isArray(value)
+      ? Array.from(new Set(value.filter(id => typeof id === 'number' && Number.isSafeInteger(id) && id > 0 && allowedIds.has(id)))).slice(0, 20)
+      : []
+    if (!ids.length) return false
+    const facts = await this.dbGet('interlude_fact', { storyId, id: { $in: ids }, status: 'active' }) as NarrativeFact[]
+    const unresolved = facts.filter(fact => fact.unresolved)
+    if (!unresolved.length) return false
+    await this.dbSet('interlude_fact', { id: { $in: unresolved.map(fact => fact.id) } }, { unresolved: false, lastSeenAt: now, updatedAt: now })
+    return true
+  }
+
+  private async markContinuityDirty(storyId: string, now: Date) {
+    const story = await this.getStory(storyId)
+    const state = normalizeStoryState(story.state)
+    if (state.continuityDirty) return
+    await this.dbSet('interlude_story', { id: storyId }, { state: { ...state, continuityDirty: true }, updatedAt: now })
   }
 
   private emitLog(level: 'error' | 'warn' | 'info' | 'debug', output: string) {
@@ -4453,6 +5415,20 @@ export class InterludeService extends Service {
       const rows = await this.ctx.database.get(table as never, query as never, options as never) as any[]
       return rows.map(row => normalizeDatabaseRow(table, row))
     })
+  }
+
+  /** Repair only a stale canonical story whose configured bot is no longer
+   * online. A live OneBot session is stronger evidence than historical story
+   * metadata, while a still-online story bot remains untouched. */
+  private async repairCanonicalOneBotStoryTransport(story: InterludeStory, session: Session) {
+    if (!isOneBotPlatform(session.platform) || !session.selfId) return story
+    const hasLiveStoryBot = this.ctx.bots.some(bot => String(bot.selfId) === String(story.selfId)
+      && (bot.platform === story.platform || isOneBotPlatform(bot.platform) && isOneBotPlatform(story.platform)))
+    if (hasLiveStoryBot || (story.platform === session.platform && String(story.selfId) === String(session.selfId))) return story
+    const now = new Date()
+    await this.dbSet('interlude_story', { id: story.id }, { platform: session.platform, selfId: session.selfId, updatedAt: now })
+    this.reportStandalone('warn', '主剧本投递账号已自愈 故事=%s 平台=%s 账号=%s', story.id, session.platform, session.selfId)
+    return { ...story, platform: session.platform, selfId: session.selfId, updatedAt: now }
   }
 
   private async retryDbWrite<T>(task: () => Promise<T>) {
@@ -4769,6 +5745,58 @@ function stickerMime(filePath: string) {
   return 'image/png'
 }
 
+/** The old punctuation-only id could collide (for example two filenames that
+ * both normalize to bq--6-). Keep a readable path prefix, then append a
+ * content hash fragment so every row is globally unique and stable for an
+ * unchanged file. */
+export function stableStickerAssetId(filePath: string, hash: string) {
+  const stem = String(filePath ?? '')
+    .replace(/\\/g, '/')
+    .replace(/\.[^.]+$/, '')
+    .replace(/[^a-zA-Z0-9/_-]/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^[-/]+|[-/]+$/g, '')
+    .slice(0, 220) || 'sticker'
+  const suffix = String(hash ?? '').replace(/[^a-fA-F0-9]/g, '').slice(0, 16).toLowerCase() || 'unhashed'
+  return `${stem}-${suffix}`.slice(0, 255)
+}
+
+/** Extract only explicit clock statements from a live user message. This is a
+ * small factual aid, not an attempt to infer every temporal expression. */
+export function extractUserReportedTimes(content: string, now: Date, timezone: string): UserReportedTime[] {
+  const text = String(content ?? '')
+  const currentMinutes = localClockMinutes(now, timezone)
+  const date = calendarDayKey(now, timezone)
+  const facts: UserReportedTime[] = []
+  const seen = new Set<string>()
+  const add = (hour: number, minute: number, statement: string) => {
+    if (!Number.isInteger(hour) || !Number.isInteger(minute) || hour < 0 || hour > 23 || minute < 0 || minute > 59) return
+    const clock = `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`
+    const relation: UserReportedTime['relation'] = hour * 60 + minute < currentMinutes ? 'past'
+      : hour * 60 + minute > currentMinutes ? 'future' : 'current'
+    const key = `${clock}:${statement}`
+    if (seen.has(key)) return
+    seen.add(key)
+    facts.push({ localTime: `${date} ${clock}`, relation, statement: clip(statement, 240).trim() })
+  }
+  for (const match of text.matchAll(/(?:今天|今晚|下午|晚上|早上|上午)?\s*(\d{1,2})\s*(?:[:：.]|点)\s*(\d{2}|半)?/g)) {
+    let hour = Number(match[1])
+    const minute = match[2] === '半' ? 30 : match[2] ? Number(match[2]) : 0
+    const prefix = match[0]
+    if ((prefix.includes('下午') || prefix.includes('晚上')) && hour < 12) hour += 12
+    else if (!/(?:早上|上午|下午|晚上|中午)/.test(prefix) && hour > 0 && hour < 12) {
+      // Bare “6.30” is ambiguous. Prefer the 12-hour interpretation nearest
+      // to the current story clock, so an evening report normally means 18:30
+      // rather than an implausibly distant 06:30.
+      const morning = hour * 60 + minute
+      const evening = (hour + 12) * 60 + minute
+      if (Math.abs(evening - currentMinutes) < Math.abs(morning - currentMinutes)) hour += 12
+    }
+    add(hour, minute, text.slice(Math.max(0, match.index! - 48), Math.min(text.length, match.index! + match[0].length + 96)))
+  }
+  return facts.slice(0, 4)
+}
+
 export function describeQuotedMessage(session: Session, characterName = '主角'): QuotedMessageContext | undefined {
   const quote = session.quote as any
   if (!quote) return undefined
@@ -4819,6 +5847,39 @@ function normalizeQuotedMessageContext(value: unknown): QuotedMessageContext | u
 export function normalizeAllowedReactions(value: unknown): ChatReactionName[] {
   if (!Array.isArray(value)) return []
   return Array.from(new Set(value.filter((item): item is ChatReactionName => CHAT_REACTION_NAMES.includes(item as ChatReactionName)))).slice(0, CHAT_REACTION_NAMES.length)
+}
+
+/** Parse only the narrow event ledger shape. Unknown model fields and empty
+ * plans are discarded before they can become a source of world state. */
+export function normalizeTimelinePlan(value: unknown): TimelinePlan | undefined {
+  if (!isRecord(value) || !Array.isArray(value.beats)) return undefined
+  const beats = value.beats
+    .filter(isRecord)
+    .map(item => ({
+      at: typeof item.at === 'number' ? Math.max(0, Math.min(1, item.at)) : Number.NaN,
+      kind: item.kind === 'activity' || item.kind === 'thought' || item.kind === 'state' ? item.kind : '',
+      summary: typeof item.summary === 'string' ? clip(item.summary, 240).trim() : '',
+    }))
+    .filter((item): item is TimelinePlan['beats'][number] => Number.isFinite(item.at) && !!item.kind && !!item.summary)
+    .sort((left, right) => left.at - right.at)
+    .slice(0, 4)
+  if (!beats.length) return undefined
+  const carry = Array.isArray(value.carry)
+    ? value.carry.filter(item => typeof item === 'string').map(item => clip(item, 180).trim()).filter(Boolean).slice(0, 4)
+    : []
+  return { beats, ...(carry.length ? { carry } : {}) }
+}
+
+/** Automatic script prose is a rendering, not the next turn's temporal source.
+ * A compact host ledger retains the real sequence without letting a previous
+ * paragraph be copied into a new time window. */
+export function timelineEntryPromptProjection(entry: ScriptEntry): ScriptEntry {
+  if (entry.kind !== 'script') return entry
+  const plan = normalizeTimelinePlan(entry.metadata?.timelinePlan)
+  if (!plan) return entry
+  const beats = plan.beats.map(beat => `${Math.round(beat.at * 100)}% ${beat.kind}: ${beat.summary}`).join(' | ')
+  const carry = plan.carry?.length ? ` Carry: ${plan.carry.join(' | ')}` : ''
+  return { ...entry, content: `[Host timeline ledger for this completed automatic window: ${beats}.${carry}]` }
 }
 
 export function normalizeGroupChatActions(
@@ -5120,6 +6181,36 @@ function normalizeScenePresenceState(value: unknown): ScenePresenceState[] {
   return [...latest.values()].slice(-8)
 }
 
+function normalizeWorkingDetails(value: unknown): WorkingDetail[] {
+  if (!Array.isArray(value)) return []
+  const latest = new Map<string, WorkingDetail>()
+  for (const item of value) {
+    if (!isRecord(item)) continue
+    const label = typeof item.label === 'string' ? clip(item.label, 80).trim() : ''
+    const detailValue = typeof item.value === 'string' ? clip(item.value, 300).trim() : ''
+    const expiresAt = typeof item.expiresAt === 'string' && !Number.isNaN(new Date(item.expiresAt).getTime())
+      ? item.expiresAt
+      : undefined
+    const createdAt = typeof item.createdAt === 'string' && !Number.isNaN(new Date(item.createdAt).getTime())
+      ? item.createdAt
+      : new Date(0).toISOString()
+    const sourceEntryIds = Array.isArray(item.sourceEntryIds)
+      ? item.sourceEntryIds.filter(id => typeof id === 'number' && Number.isSafeInteger(id)).slice(0, 8)
+      : undefined
+    if (!label || !detailValue) continue
+    latest.set(label, { label, value: detailValue, ...(expiresAt ? { expiresAt } : {}), createdAt, ...(sourceEntryIds?.length ? { sourceEntryIds } : {}) })
+  }
+  return [...latest.values()].slice(-10)
+}
+
+function normalizeTimelineCarry(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  return Array.from(new Set(value
+    .filter(item => typeof item === 'string')
+    .map(item => clip(item, 240).trim())
+    .filter(Boolean))).slice(0, 4)
+}
+
 /** Scene compaction may update a tiny roster only with explicit observed
  * evidence. This keeps named supporting cast available without treating them
  * as automatically present. */
@@ -5203,11 +6294,10 @@ function normalizeContinuitySnapshot(value: unknown): ContinuitySnapshot | undef
     ? item.map(value => text(value, limit)).filter(Boolean).slice(0, 5)
     : []
   const current = text(value.current, 500)
-  const next = list(value.next, 300).slice(0, 3)
   const recent = list(value.recent, 300)
   const salient = list(value.salient, 400)
-  if (!current && !next.length && !recent.length && !salient.length) return undefined
-  return { current, next, recent, salient }
+  if (!current && !recent.length && !salient.length) return undefined
+  return { current, next: [], recent, salient }
 }
 
 function normalizeBrowserIntentDraftLoose(value: unknown): BrowserIntentDraft | undefined {
@@ -5447,9 +6537,12 @@ function normalizeStoryState(value: unknown): StoryState {
     continuitySnapshot: continuity,
     narrativeUpdateCount: Math.max(0, Math.floor(typeof record.narrativeUpdateCount === 'number' ? record.narrativeUpdateCount : 0)),
     lastContinuityUpdateAt: typeof record.lastContinuityUpdateAt === 'string' ? record.lastContinuityUpdateAt : undefined,
+    continuityDirty: record.continuityDirty === true,
     alterSystem: normalizeAlterSystemState(record.alterSystem),
     agencyWindow: normalizeAgencyWindowState(record.agencyWindow),
     scenePresence: normalizeScenePresenceState(record.scenePresence),
+    workingDetails: normalizeWorkingDetails(record.workingDetails),
+    timelineCarry: normalizeTimelineCarry(record.timelineCarry),
     automaticDeliverySummaries: normalizeAutomaticDeliverySummaries(record.automaticDeliverySummaries),
     automation: {
       quietUntil: typeof automation.quietUntil === 'string' ? automation.quietUntil : undefined,
@@ -5526,6 +6619,7 @@ const DATABASE_DATE_FIELDS: Record<string, string[]> = {
   interlude_overlay_snapshot: ['periodStart', 'periodEnd', 'createdAt', 'updatedAt'],
   interlude_sticker: ['createdAt', 'updatedAt'],
   interlude_web_observation: ['accessedAt', 'createdAt'],
+  interlude_schedule_preplan: ['createdAt', 'updatedAt'],
 }
 
 /** Minato normally materializes timestamp columns as Date objects. Some
@@ -5602,7 +6696,7 @@ function factScore(fact: NarrativeFact, config: MemoryConfig, queryEmbedding: nu
     + fact.confidence * config.factConfidenceWeight
     + recency * config.factRecencyWeight
     + semantic * config.semanticWeight
-    + (fact.unresolved ? 1 : 0) * config.unresolvedWeight
+    + (fact.scope === 'promise' && fact.unresolved ? 1 : 0) * config.unresolvedWeight
 }
 
 function cosineSimilarity(left: number[], right: number[]) {
@@ -5617,6 +6711,29 @@ function cosineSimilarity(left: number[], right: number[]) {
   }
   if (!leftMagnitude || !rightMagnitude) return undefined
   return dot / Math.sqrt(leftMagnitude * rightMagnitude)
+}
+
+/** How many sticker descriptions a semantically filtered turn injects. */
+export const SEMANTIC_STICKER_LIMIT = 12
+
+/** Pure ranking used by the semantic sticker filter. Assets without a vector
+ * still fill remaining slots after the embedded ones so a half-indexed library
+ * degrades gracefully instead of hiding entries. */
+export function rankStickerCatalog<T extends { embedding?: number[] }>(assets: T[], queryEmbedding: number[], limit: number): T[] {
+  if (!queryEmbedding.length || assets.length <= limit) return assets
+  return assets
+    .map(asset => ({ asset, score: cosineSimilarity(queryEmbedding, asset.embedding ?? []) ?? -1 }))
+    .sort((left, right) => right.score - left.score)
+    .slice(0, Math.max(1, limit))
+    .map(item => item.asset)
+}
+
+/** Only static raster images worth the re-render enter Puppeteer downscaling:
+ * tiny images would not shrink further and animated ones have their own path. */
+export function shouldDownscaleImage(mimeType: string, dataUri: string): boolean {
+  if (!/^image\/(?:jpeg|png|webp)$/i.test(mimeType)) return false
+  const binaryLength = Math.floor((dataUri.split(',')[1] ?? '').length * 3 / 4)
+  return binaryLength >= 150 * 1024
 }
 
 function createFactQuery(participant: InterludeParticipant | null, userMessage: string | undefined, dueIntents: NarrativeIntent[], supersededIntents: NarrativeIntent[]) {
