@@ -1,6 +1,6 @@
 import { Context, Schema, Session } from 'koishi'
 import { CompactionConfig, EmbeddingConfig, FailoverConfig, ModelConfig, ProviderConfig, VisionConfig } from './narrator'
-import { BlindModeConfig, BrowserConfig, ChatActionsConfig, Config as InterludeConfig, extractSessionVoiceCount, GroupChatRule, InterludeService, LoggingConfig, MemoryConfig, OneBotAccountRule, OneBotNapCatConfig, RestWindow, RuntimeConfig, SharedStoryConfig, StickerLibraryConfig, StoryDefaults } from './service'
+import { BlindModeConfig, BrowserConfig, ChatActionsConfig, Config as InterludeConfig, extractSessionVoiceCount, GroupChatRule, InterludeService, LoggingConfig, MemoryConfig, OneBotAccountRule, OneBotNapCatConfig, RestWindow, RuntimeConfig, SharedStoryConfig, StickerLibraryConfig, StoryDefaults, TTSConfig } from './service'
 import { AgencyConfig, AlterSystemConfig, ChatReactionName, NativeFaceSemantic, StorySetting } from './types'
 import { HDS_INTERLUDE_VERSION } from './meta'
 import { GroupWillingnessConfig } from './group-willingness'
@@ -130,6 +130,17 @@ const Vision: Schema<VisionConfig> = Schema.object({
   detail: Schema.union(['low', 'high', 'auto']).default('auto').description('图片细节：low / high / auto。'),
   maxImageDimension: Schema.union([0, 512, 768, 1024]).default(1024).description('图片最长边；0 使用原图。'),
   extraTrustedImageHosts: Schema.array(Schema.string()).default([]).description('额外信任的识图图源域名（如 Telegram 反代域名），也可用环境变量 HDSI_TRUSTED_IMAGE_HOSTS（逗号分隔）。'),
+}).collapse(true)
+
+const TTS: Schema<TTSConfig> = Schema.object({
+  enabled: Schema.boolean().default(false).description('启用 TTS:角色消息附带语音(需自部署 mitts / 小米 MiMo TTS 服务)。'),
+  endpoint: Schema.string().role('url').default('https://mitts.yegetables.com/tts').description('mitts 服务的 /tts 端点。'),
+  apiKey: Schema.string().role('secret').default('').description('小米 MiMo 平台 API Key(mitts 转发上游所需)。'),
+  model: Schema.union(['v2.5', 'v2.5_design', 'v2.5_clone', 'v2']).default('v2.5').description('合成模式:内置音色 / 文本描述音色 / 音色克隆。'),
+  voice: Schema.string().default('茉莉').description('v2.5:内置音色 id(冰糖/茉莉/苏打/白桦/Mia/Chloe/Milo/Dean);design:音色描述文本;clone:样本音频 http(s) 链接或 data URI(5-30 秒 MP3/WAV)。'),
+  mode: Schema.union(['off', 'all', 'proactive']).default('proactive').description('哪些消息附带语音:proactive=仅主动联系与到期投递;all=所有可见消息。'),
+  maxCharacters: Schema.natural().default(300).description('超过此字数的消息跳过语音,只发文本。'),
+  timeout: Schema.natural().default(60000).role('ms').description('单次合成超时,单位毫秒。'),
 }).collapse(true)
 
 const Model: Schema<ModelConfig> = Schema.object({
@@ -444,6 +455,7 @@ export const Config: Schema<InterludeConfig> = Schema.object({
   alterSystem: AlterSystem.description('11. 高级 Alter：低频氛围偏移、动态阈值、权重和侧端分析。'),
   browser: Browser.description('12. 可选网页观察：Puppeteer 只读浏览与安全边界。'),
   logging: Logging.description('13. 高级日志：级别、信息密度、布局和隐私预览。'),
+  tts: TTS.description('14. 可选 TTS 语音：mitts / 小米 MiMo，让角色的消息附带语音。'),
 })
 
 export function apply(ctx: Context, config: InterludeConfig) {

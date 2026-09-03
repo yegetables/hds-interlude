@@ -1,8 +1,9 @@
 import { Context, h, Logger, Service, Session, Time } from 'koishi'
 import { registerTables } from './database'
-import { readFile, readdir, stat } from 'node:fs/promises'
+import { readFile, readdir, stat, unlink, writeFile } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
-import { extname, relative, resolve, sep } from 'node:path'
+import { extname, join, relative, resolve, sep } from 'node:path'
+import { tmpdir } from 'node:os'
 import { pathToFileURL } from 'node:url'
 import { configuredProviders, createCompactor, createEmbedder, createNarrator, createStickerDescriber, createVisionDescriber, effectiveMainModelId, formatTokenUsageLine, ModelConfig, promptVisibleMessageContent, recentScriptOwnership, StickerDescriber, TokenUsageRecord, usesRemoteProviders, VisionDescriber } from './narrator'
 import {
@@ -116,6 +117,38 @@ function isTrustedImageHost(hostname: string, extra: readonly string[] = []) {
     .some(domain => host === domain || host.endsWith(`.${domain}`))
 }
 
+export type TTSMode = 'off' | 'all' | 'proactive'
+export type TTSModel = 'v2.5' | 'v2.5_design' | 'v2.5_clone' | 'v2'
+
+/** Optional TTS: let delivered character messages carry synthesized speech via
+ * a mitts-compatible endpoint (Xiaomi MiMo TTS). */
+export interface TTSConfig {
+  enabled?: boolean
+  /** Full mitts /tts endpoint. */
+  endpoint?: string
+  /** Xiaomi MiMo platform API key, forwarded by mitts to its upstream. */
+  apiKey?: string
+  model?: TTSModel
+  /** v2.5: builtin voice id; v2.5_design: voice description text; v2.5_clone: sample as http(s) URL or data URI. */
+  voice?: string
+  /** Which delivered messages carry speech. */
+  mode?: TTSMode
+  /** Skip TTS for messages longer than this many characters. */
+  maxCharacters?: number
+  timeout?: number
+}
+
+const ttsCloneSampleCache = new Map<string, string>()
+
+function stripMarkupForTTSText(content: string) {
+  return content
+    .replace(/\[CQ:[^\]]*\]/gi, '')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
 export interface Config {
   /** Immersive operation that suppresses HDSI visibility and Koishi commands. */
   blindMode?: BlindModeConfig
@@ -134,6 +167,7 @@ export interface Config {
   /** Optional cross-platform chat gestures; runtime connector availability remains authoritative. */
   chatActions?: ChatActionsConfig
   stickers?: StickerLibraryConfig
+  tts?: TTSConfig
   alterSystem?: AlterSystemConfig
   agency?: AgencyConfig
   schedulePreplan?: SchedulePreplanConfig
@@ -4009,6 +4043,86 @@ export class InterludeService extends Service {
    * This is the boundary that prevents a shared story from accidentally
    * sending every reply back to the account that happened to trigger the turn.
    */
+  private resolveTTSConfig() {
+    const cfg = this.config.tts
+    if (!cfg?.enabled) return undefined
+    const endpoint = String(cfg.endpoint ?? '').trim()
+    const apiKey = String(cfg.apiKey ?? '').trim()
+    if (!endpoint || !apiKey) return undefined
+    return {
+      endpoint,
+      apiKey,
+      model: cfg.model ?? 'v2.5',
+      voice: String(cfg.voice ?? '茉莉').trim(),
+      mode: cfg.mode ?? 'off',
+      maxCharacters: cfg.maxCharacters ?? 300,
+      timeout: cfg.timeout ?? 60_000,
+    }
+  }
+
+  private async resolveTTSCloneSample(source: string) {
+    const cached = ttsCloneSampleCache.get(source)
+    if (cached) return cached
+    let base64 = ''
+    if (/^data:audio\//i.test(source)) {
+      const comma = source.indexOf(',')
+      base64 = comma >= 0 ? source.slice(comma + 1) : ''
+    } else if (/^https?:\/\//i.test(source)) {
+      const response = await this.ctx.http('GET', source, { responseType: 'arraybuffer', timeout: 30_000 })
+      base64 = Buffer.from(response.data).toString('base64')
+    }
+    if (!base64) throw new Error('克隆样本为空:voice 需为 http(s) 音频链接或 data URI')
+    ttsCloneSampleCache.set(source, base64)
+    return base64
+  }
+
+  private async synthesizeTTSAudio(cfg: { endpoint: string, apiKey: string, model: TTSModel, voice: string, timeout: number }, text: string) {
+    const payload: Record<string, unknown> = { api_key: cfg.apiKey, text, model: cfg.model }
+    if (cfg.model === 'v2.5_clone') {
+      payload.audio = await this.resolveTTSCloneSample(cfg.voice)
+      payload.voice = 'clone'
+    } else {
+      payload.voice = cfg.voice
+    }
+    const response = await this.ctx.http('POST', cfg.endpoint, {
+      headers: { 'Content-Type': 'application/json' },
+      data: payload,
+      responseType: 'arraybuffer',
+      timeout: cfg.timeout,
+    })
+    const buffer = Buffer.from(response.data)
+    const contentType = String(response.headers?.get?.('content-type') ?? '').toLowerCase()
+    if (!contentType.startsWith('audio/')) {
+      throw new Error(`TTS 上游返回非音频(${contentType || '未知'}):${buffer.toString('utf8').slice(0, 200)}`)
+    }
+    return { buffer, extension: cfg.model === 'v2.5_clone' ? '.wav' : '.mp3' }
+  }
+
+  private async sendTTSVoice(story: InterludeStory, transport: { session?: Session, bot?: any, channelId: string }, content: string, userInitiated: boolean, literalQuote: boolean) {
+    const cfg = this.resolveTTSConfig()
+    if (!cfg) return
+    if (cfg.mode === 'off') return
+    if (cfg.mode === 'proactive' && userInitiated) return
+    if (literalQuote) return
+    const ttsText = stripMarkupForTTSText(content)
+    if (!ttsText || ttsText.length > cfg.maxCharacters) return
+    try {
+      const { buffer, extension } = await this.synthesizeTTSAudio(cfg, ttsText)
+      const tempFile = join(tmpdir(), `hdsi-tts-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}${extension}`)
+      await writeFile(tempFile, buffer)
+      try {
+        const element = h('audio', { src: pathToFileURL(tempFile).href })
+        if (transport.session) await transport.session.send(element)
+        else if (transport.bot) await transport.bot.sendMessage(transport.channelId, element)
+        this.reportOperation('standard', 'info', story, 'intent-due', 'TTS 语音已发送 字数=%d 模式=%s', ttsText.length, cfg.mode)
+      } finally {
+        await unlink(tempFile).catch(() => {})
+      }
+    } catch (error) {
+      this.report('warn', story, 'intent-due', 'TTS 语音合成或发送失败 错误=%s', error)
+    }
+  }
+
   private async sendOutgoingMessages(
     story: InterludeStory,
     messages: OutgoingMessageDraft[],
@@ -4059,6 +4173,7 @@ export class InterludeService extends Service {
         }
         if (session && current?.id === target.id) {
           await session.send(outgoingContent)
+          await this.sendTTSVoice(story, { session, channelId: target.channelId }, message.content, message.userInitiated === true, !!literalQuoteMessageId)
           delivered.push(message)
           continue
         }
@@ -4069,6 +4184,7 @@ export class InterludeService extends Service {
           continue
         }
         await bot.sendMessage(target.channelId, outgoingContent)
+        await this.sendTTSVoice(story, { bot, channelId: target.channelId }, message.content, message.userInitiated === true, !!literalQuoteMessageId)
         delivered.push(message)
       } catch (error) {
         this.report('warn', story, 'intent-due', '消息投递失败 参与者=%s 错误=%s', target.id, error)

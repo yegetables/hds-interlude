@@ -1,7 +1,8 @@
 # HDS Interlude — Telegram 版部署指南
 
 这是 [HDS Interlude](https://gitee.com/MomoiCore/hds-interlude) 的 Telegram 适配 fork
-(`0.1.4-tg.2`,基于上游 v0.1.4),跳过语音转写,其余 QQ 特有能力已适配或天然可用。
+(`0.1.4-tg.3`,基于上游 v0.1.4),跳过语音转写,其余 QQ 特有能力已适配或天然可用。
+**本 fork 新增:TTS 语音合成**(mitts / 小米 MiMo),让角色的消息附带语音,支持内置音色 / 文本描述音色 / 音色克隆。
 
 ## 这个 fork 改了什么
 
@@ -113,6 +114,27 @@ docker compose -f docker-compose.1panel.yaml restart koishi
 
 即:自建反代 `tgapi.yegetables.com` 后,把上面第 1、2 层都指向它,识图链路就走反代;
 但 **API 调用层永远直连 api.telegram.org**,务必确保服务器本身可达(代理或境外机)。
+
+## TTS 语音(本 fork 新增)
+
+让庄方宜的消息附带语音,走你自部署的 mitts 服务(小米 MiMo TTS)。
+
+**配置**(控制台 → hds-interlude →「14. 可选 TTS 语音」):
+
+| 字段 | 说明 |
+|---|---|
+| 启用 | 开关 |
+| endpoint | mitts 的 `/tts` 端点,默认 `https://mitts.yegetables.com/tts` |
+| **apiKey** | **小米 MiMo 平台**的 API Key(mitts 转发上游用,不是中转站 key) |
+| model | `v2.5` 内置音色 / `v2.5_design` 文本描述音色 / `v2.5_clone` 音色克隆 / `v2` 旧版 |
+| voice | `v2.5`:内置音色 id(冰糖/茉莉/苏打/白桦/Mia/Chloe/Milo/Dean);`design`:音色描述文本;`clone`:样本音频 http(s) 链接或 data URI(5-30 秒 MP3/WAV) |
+| mode | `off` / `proactive`(默认,仅主动联系与到期投递带语音)/ `all`(所有消息) |
+| maxCharacters | 超过此字数只发文本不发语音(默认 300) |
+
+**庄方宜推荐**:model 用 `v2.5_design`,voice 填音色描述,例如
+`温柔知性的年轻女声,平静时如春风,语速偏快时干脆利落,自带轻微的距离感与威严,尾音柔和`。
+要克隆游戏原声:把 5-30 秒语音样本放到任意可达 URL,model 选 `v2.5_clone`,voice 填样本链接。
+注意 TG 侧以音频消息(sendAudio)发送,不是圆形语音条;合成失败只跳过语音,文本照常投递。
 
 ## 1Panel 变体(docker-compose.1panel.yaml)
 

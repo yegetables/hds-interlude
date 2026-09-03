@@ -8,7 +8,7 @@ import { HDS_INTERLUDE_VERSION } from '../src/meta'
 test('Console sections follow the documented setup order', () => {
   assert.deepEqual(Object.keys(Config.dict), [
     'blindMode', 'storyDefaults', 'model', 'onebot', 'runtime', 'schedulePreplan', 'sharedStory', 'chatActions',
-    'stickers', 'agency', 'memory', 'alterSystem', 'browser', 'logging',
+    'stickers', 'agency', 'memory', 'alterSystem', 'browser', 'logging', 'tts',
   ])
 })
 
@@ -47,7 +47,7 @@ test('ignored compatibility switches stay out of the active Console', () => {
 
 test('runtime and plugin exports share one version constant', () => {
   assert.equal(version, HDS_INTERLUDE_VERSION)
-  assert.equal(version, '0.1.4-tg.2')
+  assert.equal(version, '0.1.4-tg.3')
 })
 
 test('layered colored logs are the Console default and remain optional', () => {

@@ -11,6 +11,25 @@ export declare function isHistoryEntryVisibleToParticipant(entry: Pick<ScriptEnt
  * it. An inactive or small sticker library must not silently turn ordinary
  * fact embedding into a per-message network request. */
 export declare function shouldRequestTurnEmbedding(embedding: ModelConfig['embedding'] | undefined, stickerLibraryEnabled: boolean, stickerCount: number): boolean;
+export type TTSMode = 'off' | 'all' | 'proactive';
+export type TTSModel = 'v2.5' | 'v2.5_design' | 'v2.5_clone' | 'v2';
+/** Optional TTS: let delivered character messages carry synthesized speech via
+ * a mitts-compatible endpoint (Xiaomi MiMo TTS). */
+export interface TTSConfig {
+    enabled?: boolean;
+    /** Full mitts /tts endpoint. */
+    endpoint?: string;
+    /** Xiaomi MiMo platform API key, forwarded by mitts to its upstream. */
+    apiKey?: string;
+    model?: TTSModel;
+    /** v2.5: builtin voice id; v2.5_design: voice description text; v2.5_clone: sample as http(s) URL or data URI. */
+    voice?: string;
+    /** Which delivered messages carry speech. */
+    mode?: TTSMode;
+    /** Skip TTS for messages longer than this many characters. */
+    maxCharacters?: number;
+    timeout?: number;
+}
 export interface Config {
     /** Immersive operation that suppresses HDSI visibility and Koishi commands. */
     blindMode?: BlindModeConfig;
@@ -29,6 +48,7 @@ export interface Config {
     /** Optional cross-platform chat gestures; runtime connector availability remains authoritative. */
     chatActions?: ChatActionsConfig;
     stickers?: StickerLibraryConfig;
+    tts?: TTSConfig;
     alterSystem?: AlterSystemConfig;
     agency?: AgencyConfig;
     schedulePreplan?: SchedulePreplanConfig;
@@ -686,6 +706,10 @@ export declare class InterludeService extends Service {
      * This is the boundary that prevents a shared story from accidentally
      * sending every reply back to the account that happened to trigger the turn.
      */
+    private resolveTTSConfig;
+    private resolveTTSCloneSample;
+    private synthesizeTTSAudio;
+    private sendTTSVoice;
     private sendOutgoingMessages;
     /** Confirm visible delivery only after the platform accepted the message.
      * Failed attempts become explicit system evidence rather than fictional
