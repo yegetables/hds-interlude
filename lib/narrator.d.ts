@@ -333,7 +333,7 @@ export declare function toPromptPayload(request: NarrativeRequest, options?: {
     }[];
     durableFacts: {
         participantId: string;
-        scope: "character" | "relationship" | "world" | "event" | "promise";
+        scope: "promise" | "character" | "world" | "relationship" | "event";
         content: string;
         importance: number;
         confidence: number;
@@ -730,7 +730,7 @@ export declare function toPromptPayload(request: NarrativeRequest, options?: {
     }[];
     durableFacts: {
         participantId: string;
-        scope: "character" | "relationship" | "world" | "event" | "promise";
+        scope: "promise" | "character" | "world" | "relationship" | "event";
         content: string;
         importance: number;
         confidence: number;
@@ -754,5 +754,5 @@ export declare function toPromptPayload(request: NarrativeRequest, options?: {
 /** Compact ownership tags for cache-first payloads: one short label replaces the
  * kind/actor/participantId triple. Distinctions the ownership label alone would
  * lose (group posting, platform actions) survive as suffixes. */
-export declare function compactScriptTag(kind: string, actor: string): "system" | "user" | "protagonist(group)" | "protagonist(action)" | "protagonist" | "protagonist-narration" | "group-member";
+export declare function compactScriptTag(kind: string, actor: string): "user" | "system" | "protagonist(group)" | "protagonist(action)" | "protagonist" | "protagonist-narration" | "group-member";
 export declare function promptVisibleMessageContent(content: string, ownership: RecentScriptOwnership): string;

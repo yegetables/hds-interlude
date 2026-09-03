@@ -1,5 +1,6 @@
 node_modules/
 tsconfig.tsbuildinfo
+*.tgz
 .env
 .env.*
 !.env.example

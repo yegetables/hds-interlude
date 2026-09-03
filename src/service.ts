@@ -96,9 +96,12 @@ type PreparedCompaction = PreparedCompactionSkip | PreparedCompactionRun
 
 // Only QQ/OneBot CDN hosts are fetched in the native-vision path. This keeps
 // arbitrary user-provided URLs from becoming an internal-network fetch proxy.
+// api.telegram.org (Bot API file downloads) is trusted for the Telegram
+// adapter. Note its URLs embed the bot token: prefer sidecar vision mode so
+// token-bearing URLs are not handed to external model providers.
 function isTrustedImageHost(hostname: string) {
   const host = hostname.toLowerCase().replace(/\.$/, '')
-  const allowed = ['gchat.qpic.cn', 'c2cpicdw.qpic.cn', 'multimedia.nt.qq.com.cn', 'thirdqq.qlogo.cn', 'q.qlogo.cn']
+  const allowed = ['gchat.qpic.cn', 'c2cpicdw.qpic.cn', 'multimedia.nt.qq.com.cn', 'thirdqq.qlogo.cn', 'q.qlogo.cn', 'api.telegram.org']
   return allowed.some(domain => host === domain || host.endsWith(`.${domain}`))
 }
 

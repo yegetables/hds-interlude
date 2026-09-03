@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { readFileSync, readdirSync } from 'node:fs'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { HDS_INTERLUDE_VERSION } from '../src/meta'
+import { FORK_BASE_VERSION, HDS_INTERLUDE_VERSION } from '../src/meta'
 
 const pluginRoot = fileURLToPath(new URL('..', import.meta.url))
 
@@ -13,16 +13,18 @@ function read(relativePath: string) {
 test('release-facing files share the runtime version', () => {
   const manifest = JSON.parse(read('package.json')) as { version: string, files: string[] }
   assert.equal(manifest.version, HDS_INTERLUDE_VERSION)
+  // Fork(0.1.4-tg.N)沿用上游基准版本命名的文档与部署 HTML,不重写上游物料;
+  // 只有 package.json 必须与 fork 运行时版本一致。
   for (const file of [
     'README.md', 'CONFIGURATION_GUIDE.md', 'BEGINNER_GUIDE.md', 'DEPLOYMENT_GUIDE.md', 'command.md',
     'docs/ARCHITECTURE.md', 'docs/AGENCY_WINDOW.md', 'docs/ALTER_SYSTEM.md', 'docs/SCHEDULE_PREPLAN.md', 'docs/README.md', 'docs/SECURITY.md',
     'docs/development/logging/LAYERED_LOG_IMPLEMENTATION.md',
   ]) {
-    assert.match(read(file), new RegExp(HDS_INTERLUDE_VERSION.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), file)
+    assert.match(read(file), new RegExp(FORK_BASE_VERSION.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), file)
   }
-  const guide = readdirSync(pluginRoot).find(name => name.endsWith('.html') && name.includes(HDS_INTERLUDE_VERSION))
+  const guide = readdirSync(pluginRoot).find(name => name.endsWith('.html') && name.includes(FORK_BASE_VERSION))
   assert.ok(guide, `missing deployment HTML for ${HDS_INTERLUDE_VERSION}`)
-  assert.match(read(guide!), new RegExp(`koishi-plugin-hds-interlude-${HDS_INTERLUDE_VERSION.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.tgz`))
+  assert.match(read(guide!), new RegExp(`koishi-plugin-hds-interlude-${FORK_BASE_VERSION.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.tgz`))
 })
 
 test('published documentation includes every README-linked design index and current setup wording', () => {

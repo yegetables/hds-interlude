@@ -1,0 +1,17 @@
+services:
+  koishi:
+    container_name: koishi
+    image: koishijs/koishi:latest
+    restart: always
+    environment:
+      - TZ=Asia/Shanghai
+    ports:
+      # 控制台只绑本机,外网访问用 SSH 隧道:
+      #   ssh -L 5140:127.0.0.1:5140 <user>@<server>
+      # 确认已有保护(防火墙白名单/反代加认证/控制台密码)后,
+      # 才改成 "5140:5140" 对公网开放。
+      - "127.0.0.1:5140:5140"
+    volumes:
+      - ./koishi:/koishi          # Koishi 实例:配置、node_modules、HDSI 数据库全在这里,备份就备它
+      - ./pkg:/pkg:ro             # HDSI-TG 插件安装包
+      - ./install.sh:/opt/install.sh:ro

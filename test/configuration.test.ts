@@ -47,7 +47,7 @@ test('ignored compatibility switches stay out of the active Console', () => {
 
 test('runtime and plugin exports share one version constant', () => {
   assert.equal(version, HDS_INTERLUDE_VERSION)
-  assert.equal(version, '0.1.4')
+  assert.equal(version, '0.1.4-tg.1')
 })
 
 test('layered colored logs are the Console default and remain optional', () => {

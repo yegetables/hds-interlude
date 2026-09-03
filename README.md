@@ -4,6 +4,11 @@
 
 交流群：421430402，群主24小时解答，欢迎来玩！
 
+> [!IMPORTANT]
+> **Telegram 适配 fork（`0.1.4-tg.1`）。** 本仓库基于 [MomoiCore/hds-interlude](https://gitee.com/MomoiCore/hds-interlude)（GitHub 镜像：[euphoriaaaaaa1/hds-interlude](https://github.com/euphoriaaaaaa1/hds-interlude)），遵循上游 AGPL-3.0 协议。
+> 上游核心能力（主叙事 / 自动推进 / 主动联系 / 记忆分层 / 贴纸库，私聊场景）平台无关，本 fork 在此之上：识图 allowlist 支持 Telegram 图源、构建配置自包含化、新增 `deploy-tg/` Koishi 单容器 Docker 部署套件，详见 **[deploy-tg/README-TG.md](deploy-tg/README-TG.md)**。
+> 已知边界：TG 群聊不进剧情；QQ 语音转写未接；QQ 原生表情与贴反应为 QQ 专有。下文文档以 QQ/OneBot 为主线，TG 部署请读 deploy-tg 指南。
+
 HDS Interlude 是一个面向 Koishi 一对一与多参与者场景的持续叙事聊天框架。它让用户消息、角色的沉默、延迟回复、主动联系和自动推进，都成为同一段生活剧本中自然可见的部分，并由一次主叙事写作连贯地决定。
 
 当前版本：`0.1.4`。提供宿主时间轴、持续生活剧本、结构化投递、Schedule Preplan、群聊意愿、多提供商模型连接与可选聊天动作。
