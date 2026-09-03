@@ -19,5 +19,5 @@ TGZ=$(ls /pkg/koishi-plugin-hds-interlude-*.tgz 2>/dev/null | head -n1)
 echo "安装 HDSI-TG: $TGZ"
 yarn add "$TGZ" --exact
 echo "安装 Telegram 适配器与 SQLite 数据库"
-yarn add koishi-plugin-adapter-telegram @koishijs/plugin-database-sqlite
+yarn add @koishijs/plugin-adapter-telegram @koishijs/plugin-database-sqlite
 echo "完成。接下来: docker compose restart koishi,然后到控制台启用插件。"

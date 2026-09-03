@@ -129,6 +129,7 @@ const Vision: Schema<VisionConfig> = Schema.object({
   mode: Schema.union(['native', 'sidecar']).default('native').description('native 由主模型识图；sidecar 使用独立视觉连接。'),
   detail: Schema.union(['low', 'high', 'auto']).default('auto').description('图片细节：low / high / auto。'),
   maxImageDimension: Schema.union([0, 512, 768, 1024]).default(1024).description('图片最长边；0 使用原图。'),
+  extraTrustedImageHosts: Schema.array(Schema.string()).default([]).description('额外信任的识图图源域名（如 Telegram 反代域名），也可用环境变量 HDSI_TRUSTED_IMAGE_HOSTS（逗号分隔）。'),
 }).collapse(true)
 
 const Model: Schema<ModelConfig> = Schema.object({

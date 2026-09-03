@@ -116,6 +116,10 @@ export interface VisionConfig {
    * Downscaling re-renders the image through the optional Puppeteer service and
    * silently passes the original through when Puppeteer is unavailable. */
   maxImageDimension?: 0 | 512 | 768 | 1024
+  /** Additional trusted image hosts (e.g. a Telegram API reverse proxy domain),
+   * merged with the built-in QQ/OneBot list and the HDSI_TRUSTED_IMAGE_HOSTS
+   * environment variable (comma separated). */
+  extraTrustedImageHosts?: string[]
 }
 
 export type VisionDetail = 'low' | 'high' | 'auto'

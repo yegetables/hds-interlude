@@ -65,6 +65,19 @@ ssh -L 5140:127.0.0.1:5140 user@server
 4. 在 TG 里**先给 bot 发一次 /start**(TG 规矩:用户没 /start 过,bot 无法主动发消息),
    之后私聊随便聊;主动联系在此之后随时生效。
 
+## 自定义 TG API 域名(反代)
+
+三层各管一段,别混淆:
+
+| 层 | 谁决定 | 怎么配 |
+|---|---|---|
+| **图片下载 URL 的域名**(HDSI 收到的 `img src`) | 适配器的 `files.baseUrl`(默认 `https://api.telegram.org`) | 控制台 → adapter-telegram → 文件设置 → "文件请求的终结点" 填 `https://tgapi.yegetables.com` |
+| **识图 allowlist**(HDSI 肯不肯去拉这个图源) | HDSI(本 fork) | 环境变量 `HDSI_TRUSTED_IMAGE_HOSTS=tgapi.yegetables.com`(compose 里加),或控制台 → hds-interlude → 图片理解 → 额外信任域名 |
+| **Bot API 调用端点**(sendMessage/getFile 等) | 适配器源码**硬编码** `https://api.telegram.org` | 换域名无效。服务器连不上 TG 时,正确姿势是给 Koishi 配 HTTP 代理(@koishijs/plugin-proxy-agent + 全局 http.proxy),或用境外服务器 |
+
+即:自建反代 `tgapi.yegetables.com` 后,把上面第 1、2 层都指向它,识图链路就走反代;
+但 **API 调用层永远直连 api.telegram.org**,务必确保服务器本身可达(代理或境外机)。
+
 ## 运维
 
 - **备份**:`./koishi` 目录(数据库、配置、node_modules 全在内)。

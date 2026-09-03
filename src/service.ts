@@ -99,10 +99,21 @@ type PreparedCompaction = PreparedCompactionSkip | PreparedCompactionRun
 // api.telegram.org (Bot API file downloads) is trusted for the Telegram
 // adapter. Note its URLs embed the bot token: prefer sidecar vision mode so
 // token-bearing URLs are not handed to external model providers.
-function isTrustedImageHost(hostname: string) {
+const BASE_TRUSTED_IMAGE_HOSTS = ['gchat.qpic.cn', 'c2cpicdw.qpic.cn', 'multimedia.nt.qq.com.cn', 'thirdqq.qlogo.cn', 'q.qlogo.cn', 'api.telegram.org']
+
+function normalizeTrustedImageHost(value: string) {
+  return value.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '').replace(/\.$/, '')
+}
+
+function readEnvTrustedImageHosts(): string[] {
+  const raw = process.env.HDSI_TRUSTED_IMAGE_HOSTS ?? ''
+  return raw.split(/[,\s]+/).map(normalizeTrustedImageHost).filter(Boolean)
+}
+
+function isTrustedImageHost(hostname: string, extra: readonly string[] = []) {
   const host = hostname.toLowerCase().replace(/\.$/, '')
-  const allowed = ['gchat.qpic.cn', 'c2cpicdw.qpic.cn', 'multimedia.nt.qq.com.cn', 'thirdqq.qlogo.cn', 'q.qlogo.cn', 'api.telegram.org']
-  return allowed.some(domain => host === domain || host.endsWith(`.${domain}`))
+  return [...BASE_TRUSTED_IMAGE_HOSTS, ...extra, ...readEnvTrustedImageHosts()]
+    .some(domain => host === domain || host.endsWith(`.${domain}`))
 }
 
 export interface Config {
@@ -2104,6 +2115,11 @@ export class InterludeService extends Service {
     }
   }
 
+  private get trustedImageHosts(): string[] {
+    return (this.config.model.vision?.extraTrustedImageHosts ?? [])
+      .map(normalizeTrustedImageHost).filter(Boolean)
+  }
+
   private async fetchNativeImage(source: string, bot?: any, adapterProvided = false): Promise<{ mimeType: string, dataUri: string } | undefined> {
     const value = String(source ?? '').trim()
     if (value.startsWith('onebot-url:')) {
@@ -2140,7 +2156,7 @@ export class InterludeService extends Service {
     let url: URL
     try { url = new URL(value) } catch { return undefined }
     if (url.protocol !== 'http:' && url.protocol !== 'https:') return undefined
-    if (!adapterProvided && !isTrustedImageHost(url.hostname)) return undefined
+    if (!adapterProvided && !isTrustedImageHost(url.hostname, this.trustedImageHosts)) return undefined
     const response = await this.ctx.http('GET', url.href, { responseType: 'arraybuffer', timeout: 10_000, redirect: 'error' })
     const bytes = Buffer.from(response.data)
     if (!bytes.length || bytes.length > 4 * 1024 * 1024) return undefined

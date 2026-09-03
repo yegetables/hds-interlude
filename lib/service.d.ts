@@ -558,6 +558,7 @@ export declare class InterludeService extends Service {
     /** Sidecar vision mirrors native image acquisition, but sends only its
      * factual result into the text narrator's current event. */
     private describeCurrentImages;
+    private get trustedImageHosts();
     private fetchNativeImage;
     /** Convert adapter/fetched bytes into one bounded native-vision attachment.
      * Animated stickers are rendered to a representative PNG frame when the

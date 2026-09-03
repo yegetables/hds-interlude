@@ -5,6 +5,8 @@ services:
     restart: always
     environment:
       - TZ=Asia/Shanghai
+      # 使用 TG API 反代/自建域名时,放行识图图源(逗号分隔多个域名):
+      # - HDSI_TRUSTED_IMAGE_HOSTS=tgapi.yegetables.com
     ports:
       # 控制台只绑本机,外网访问用 SSH 隧道:
       #   ssh -L 5140:127.0.0.1:5140 <user>@<server>
