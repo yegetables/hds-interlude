@@ -1,0 +1,32 @@
+# 1Panel 部署变体。与 docker-compose.yml 的差异:
+#   1. 接入 1Panel 的外部网络 1panel-network(需已存在,一般 1Panel 会自建;
+#      没有则手动: docker network create 1panel-network),
+#      OpenResty 反代可直接按容器名访问 http://koishi:5140
+#   2. 控制台端口映射为高位随机端口 15314(冲突时改成任意 >10000 的空闲端口)
+#   3. 挂载目录统一加容器名前缀:koishi-data / koishi-pkg
+#      ⚠ 数据目录与基础版不同:基础版是 ./koishi,本文件是 ./koishi-data;
+#        从基础版迁移:docker compose down 后 `mv koishi koishi-data` 再 up
+#   4. 环境变量首选时区 TZ=Asia/Shanghai
+services:
+  koishi:
+    container_name: koishi
+    image: koishijs/koishi:latest
+    restart: always
+    environment:
+      - TZ=Asia/Shanghai
+      # 使用 TG API 反代/自建域名时,放行识图图源(逗号分隔多个域名):
+      # - HDSI_TRUSTED_IMAGE_HOSTS=tgapi.yegetables.com
+    ports:
+      # 控制台默认无密码,端口暴露前务必:
+      # 防火墙白名单 / 1Panel 网站反代加访问限制 / 安装 @koishijs/plugin-auth 设密码
+      - "15314:5140"
+    volumes:
+      - ./koishi-data:/koishi     # Koishi 实例:配置、node_modules、HDSI 数据库全在这里,备份就备它
+      - ./koishi-pkg:/pkg:ro      # HDSI-TG 插件安装包与安装脚本
+      - ./koishi-pkg/install.sh:/opt/install.sh:ro
+    networks:
+      - 1panel-network
+
+networks:
+  1panel-network:
+    external: true

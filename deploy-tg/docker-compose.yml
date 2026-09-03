@@ -15,5 +15,5 @@ services:
       - "127.0.0.1:5140:5140"
     volumes:
       - ./koishi:/koishi          # Koishi 实例:配置、node_modules、HDSI 数据库全在这里,备份就备它
-      - ./pkg:/pkg:ro             # HDSI-TG 插件安装包
-      - ./install.sh:/opt/install.sh:ro
+      - ./koishi-pkg:/pkg:ro      # HDSI-TG 插件安装包与安装脚本
+      - ./koishi-pkg/install.sh:/opt/install.sh:ro

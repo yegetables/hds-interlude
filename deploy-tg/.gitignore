@@ -1,2 +1,3 @@
 koishi/
-pkg/*.tgz
+koishi-data/
+koishi-pkg/*.tgz

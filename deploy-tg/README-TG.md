@@ -78,10 +78,26 @@ ssh -L 5140:127.0.0.1:5140 user@server
 即:自建反代 `tgapi.yegetables.com` 后,把上面第 1、2 层都指向它,识图链路就走反代;
 但 **API 调用层永远直连 api.telegram.org**,务必确保服务器本身可达(代理或境外机)。
 
+## 1Panel 变体(docker-compose.1panel.yaml)
+
+与基础版共同一套文件(同一个 `koishi-pkg/` 提供插件包与安装脚本),差异:
+
+| 项 | 基础版 | 1Panel 版 |
+|---|---|---|
+| 网络 | compose 默认 | 外部 `1panel-network`(OpenResty 反代目标填 `http://koishi:5140`) |
+| 控制台端口 | `127.0.0.1:5140`(SSH 隧道) | `15314:5140`(高位随机端口,冲突自行换) |
+| 数据目录 | `./koishi` | `./koishi-data` |
+| 插件包目录 | `./koishi-pkg` | 同左 |
+
+部署命令完全一致(`compose up -d` → `exec koishi sh /opt/install.sh` → restart),
+只是把 `docker compose` 换成 `docker compose -f docker-compose.1panel.yaml`。
+从基础版迁移数据:`docker compose down` 后 `mv koishi koishi-data`。
+**控制台无密码**,暴露端口前先配 1Panel 网站反代 + 访问限制,或装 `@koishijs/plugin-auth`。
+
 ## 运维
 
 - **备份**:`./koishi` 目录(数据库、配置、node_modules 全在内)。
-- **升级插件**:本地重新 `npm run build && npm pack` → 覆盖 `pkg/*.tgz` → 重跑 install → restart。
+- **升级插件**:本地重新 `npm run build && npm pack` → 覆盖 `koishi-pkg/*.tgz` → 重跑 install → restart。
 - **常见问题**:剧情崩坏/格式失败 → 换更强的主叙事模型,比调配置有效;
   token 消耗 → 自动推进是常驻开销,间隔与休息时段控制成本。
 - **许可**:上游 AGPL-3.0,本 fork 同协议;自用无义务,对外提供服务需开源修改。
