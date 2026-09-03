@@ -14,7 +14,7 @@ done
 [ -f package.json ] || { echo "错误: /koishi 里没有实例骨架,首启可能失败,查 docker compose logs koishi"; exit 1; }
 
 TGZ=$(ls /pkg/koishi-plugin-hds-interlude-*.tgz 2>/dev/null | head -n1)
-[ -n "$TGZ" ] || { echo "错误: /pkg 里没有插件包"; exit 1; }
+[ -n "$TGZ" ] || { echo "错误: /pkg 里没有插件包。tgz 不在 git 仓库里,请从 Release 下载放到宿主机 koishi-pkg/ 目录:"; echo "  wget https://github.com/yegetables/hds-interlude/releases/download/v0.1.4-tg.2/koishi-plugin-hds-interlude-0.1.4-tg.2.tgz -O <koishi-pkg 目录>/"; exit 1; }
 
 echo "安装 HDSI-TG: $TGZ"
 yarn add "$TGZ" --exact

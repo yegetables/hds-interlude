@@ -28,6 +28,21 @@ TG 上找 @BotFather 建好 bot 并拿到 token(形如 `123456:ABC-xxx`)。
 以下命令按你选的变体二选一:基础版用 `docker compose`,1Panel 版加
 `-f docker-compose.1panel.yaml`。
 
+### 第 0 步:把文件弄到服务器
+
+部署需要三样:`docker-compose.yml`(或 1panel 变体)、`koishi-pkg/install.sh`、
+`koishi-pkg/*.tgz`(插件包)。**注意 tgz 不在 git 仓库里**(构建产物被 gitignore),
+git clone 后必须从 Release 补:
+
+```bash
+# 方式 A:git clone 后从 Release 补 tgz + 刷新安装脚本
+git clone https://github.com/yegetables/hds-interlude.git && cd hds-interlude/deploy-tg
+wget https://github.com/yegetables/hds-interlude/releases/download/v0.1.4-tg.2/koishi-plugin-hds-interlude-0.1.4-tg.2.tgz -O koishi-pkg/
+
+# 方式 B:整目录 scp(本地构建机上有完整 tgz)
+scp -r deploy-tg user@server:/opt/hdsi
+```
+
 ### 第 1 步:启动并等初始化完成
 
 ```bash
